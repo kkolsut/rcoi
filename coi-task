@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# coi-task - run AI agents in Coi containers, one git worktree + branch per task.
+# Repos live in ~/src; a task gets ~/src/<repo>-<task> on branch agent/<task>.
+#
+#   coi-task init   <repo>                 empty ~/src/<repo> that accepts pushes (run by `git agent init`)
+#   coi-task new    <repo> <task> [mode]   worktree ~/src/<repo>-<task> on agent/<task>, then start the agent
+#   coi-task shell  <repo> <task> [mode]   the same in an existing task worktree
+#     modes:  (none)        interactive coi shell (reattaches if the task's session is running)
+#             --bg [-p "prompt"]
+#                           background session (tmux), optionally typing the prompt into it;
+#                           with a running session, --bg -p just sends the prompt
+#             -p "prompt"   headless one-shot run (coi run --prompt), output when it ends
+#             -- cmd...     plain command (coi run; no agent settings, so no write permission)
+#   coi-task attach <repo> <task>          attach to the background session (detach: Ctrl+B, then d)
+#   coi-task peek   <repo> <task> [lines]  print the session's screen (default 40 lines)
+#   coi-task send   <repo> <task> "text"   type text + Enter into the session
+#   coi-task stop   <repo> <task>          shut the task's session down (the worktree stays)
+#   coi-task done   <repo> <task>          stop + remove the worktree + delete agent/<task> (merged only)
+#   coi-task drop   <repo> <task> [-y]     the same for unmerged work: discards it (asks first)
+#   coi-task list   [<repo>]               task worktrees and their sessions
+#
+# Code arrives from the laptop over SSH (`git agent init` / `git agent sync`
+# push main here) and goes back the same way (`git agent list` fetches the
+# agent/* branches); the agent host needs no GitHub credentials. From the laptop, run
+# any of this as `rcoi task ...` (and plain Coi commands as `rcoi ...`).
+set -euo pipefail
+
+SRC="${COI_TASK_SRC:-$HOME/src}"
+CLAUDE_STATE="$HOME/.claude.json"
+READY_TIMEOUT="${COI_TASK_READY_TIMEOUT:-180}"
+TASK_REPO="" TASK_NAME=""   # set by new/shell for the hints background() prints
+
+# Coi bind-mounts these read-only into every session and leaves empty
+# placeholders behind in the workspace. Untracked, they would end up in an
+# agent's `git add -A` and make `git worktree remove` refuse, so each repo's
+# info/exclude lists them. (Tracked copies are unaffected by exclude.)
+PLACEHOLDERS=(/.husky/ /.vscode/ /.claude/settings.json /.claude/settings.local.json /.codex/config.toml)
+
+die() { echo "coi-task: $*" >&2; exit 1; }
+say() { echo "coi-task: $*" >&2; }
+usage() { sed -n '2,25s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+
+valid() {   # repo and task names end up in paths and branch names
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ && $1 != .* ]] || die "invalid name: '$1'"
+}
+
+repo_dir() {
+  valid "$1"
+  [[ -d $SRC/$1/.git ]] || die "$SRC/$1 is not a repo (on the laptop: git agent init)"
+  echo "$SRC/$1"
+}
+
+# worktree path of an existing task: wt_dir <repo> <task>
+wt_dir() {
+  repo_dir "$1" >/dev/null; valid "$2"
+  local wt="$SRC/$1-$2"
+  [[ -d $wt ]] || die "no worktree $wt (coi-task new $1 $2)"
+  echo "$wt"
+}
+
+exclude_placeholders() {
+  local f p; f=$(git -C "$1" rev-parse --git-path info/exclude)
+  [[ $f = /* ]] || f="$1/$f"
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  for p in "${PLACEHOLDERS[@]}"; do
+    grep -qxF -- "$p" "$f" || echo "$p" >>"$f"
+  done
+}
+
+# Coi seeds each container's ~/.claude.json from this host's copy (only when
+# ~/.claude holds a config file such as settings.json). Without it every new
+# container stops at Claude's first-run theme picker and then the "trust this
+# folder" dialog, which nobody answers in a background session. Trust is per
+# exact path (a parent doesn't count), so each worktree gets its own entry;
+# done/drop remove it again. jq + flock: parallel tasks edit the same file.
+# shellcheck disable=SC2016  # $p in the filters is a jq variable
+claude_state() {   # claude_state add|del <path>
+  local op=$1 path=$2 filter
+  [[ -d $HOME/.claude ]] || mkdir -m 700 "$HOME/.claude"
+  [[ -e $HOME/.claude/settings.json ]] || echo '{}' >"$HOME/.claude/settings.json"
+  if [[ $op == add ]]; then
+    filter='.hasCompletedOnboarding = true | .theme = (.theme // "dark")
+            | .autoUpdates = false | .projects[$p].hasTrustDialogAccepted = true'
+  else
+    filter='del(.projects[$p])'
+  fi
+  (
+    flock 9
+    local cur='{}'
+    [[ -s $CLAUDE_STATE ]] && cur=$(<"$CLAUDE_STATE")
+    jq --arg p "$path" "$filter" <<<"$cur" >"$CLAUDE_STATE.tmp"
+    chmod 600 "$CLAUDE_STATE.tmp"
+    mv "$CLAUDE_STATE.tmp" "$CLAUDE_STATE"
+  ) 9>"$CLAUDE_STATE.lock"
+}
+
+# Running/frozen containers of a workspace, one per line (normally one).
+containers() {
+  coi list --format json | jq -r --arg w "$1" \
+    '.active_containers[]? | select(.workspace == $w) | .name'
+}
+container() {   # the first one, or die
+  local ct; ct=$(containers "$1" | head -1)
+  [[ -n $ct ]] || die "no running session for $1 (start one: coi-task shell ${TASK_REPO:-<repo>} ${TASK_NAME:-<task>} --bg [-p \"...\"])"
+  echo "$ct"
+}
+
+# Type text into the session's tmux pane. Not `coi tmux send`: that puts the
+# text into a double-quoted shell string, so $(...) or `...` in a prompt would
+# run in the container. send-keys -l takes it literally, straight from argv.
+# Newlines would submit early, so they become spaces. -T: no pty, otherwise
+# incus passes the caller's TERM (e.g. xterm-kitty) and tmux rejects it.
+tmux_send() {   # tmux_send <container> <text>
+  local ct=$1 text=${2//$'\n'/ }
+  local target="=coi-$ct:"
+  incus exec -T "$ct" --user 1000 -- tmux send-keys -t "$target" -l -- "$text" </dev/null
+  sleep 0.5
+  incus exec -T "$ct" --user 1000 -- tmux send-keys -t "$target" Enter </dev/null
+}
+
+wait_ready() {   # wait until Claude shows its input box
+  local ct=$1 i screen
+  for ((i = 0; i < READY_TIMEOUT; i += 2)); do
+    screen=$(coi tmux capture "$ct" 2>/dev/null || true)
+    if grep -q 'trust this folder' <<<"$screen"; then
+      die "$ct is asking to trust the folder - answer it with: coi attach $ct"
+    fi
+    grep -qE 'bypass permissions|for shortcuts' <<<"$screen" && return 0
+    sleep 2
+  done
+  die "$ct: agent not ready after ${READY_TIMEOUT}s - look with: coi attach $ct"
+}
+
+background() {   # background <wt> [prompt]
+  local wt=$1 prompt=${2:-} ct
+  ct=$(containers "$wt" | head -1)
+  if [[ -z $ct ]]; then
+    # Coi's setup output is long; keep it in a log and show it only on failure.
+    local log; log=$(mktemp "${TMPDIR:-/tmp}/coi-task-bg.XXXXXX")
+    if ! (cd "$wt" && coi shell --background) >"$log" 2>&1; then
+      tail -n 30 "$log" >&2; rm -f "$log"
+      die "coi shell --background failed in $wt"
+    fi
+    rm -f "$log"
+    ct=$(container "$wt")
+    say "started $ct"
+  fi
+  if [[ -n $prompt ]]; then
+    wait_ready "$ct"
+    tmux_send "$ct" "$prompt"
+    say "prompt sent to $ct"
+  fi
+  local repo=$TASK_REPO task=$TASK_NAME
+  cat >&2 <<EOF
+coi-task: watch:   coi-task peek $repo $task      (coi tmux capture $ct)
+coi-task: step in: coi-task attach $repo $task    (coi attach $ct; detach: Ctrl+B, then d)
+coi-task: finish:  coi-task stop $repo $task      (coi shutdown $ct)
+EOF
+  echo "$ct"
+}
+
+# Is "$@" a valid mode for new/shell? Checked before anything is created,
+# so a typo doesn't leave a worktree without a session behind.
+mode_ok() {
+  case "${1:-}" in
+    "") [[ $# -eq 0 ]] ;;
+    --bg) [[ $# -eq 1 ]] || { [[ $# -eq 3 && ($2 == -p || $2 == --prompt) && -n $3 ]]; } ;;
+    -p|--prompt) [[ $# -eq 2 && -n $2 ]] ;;
+    --) [[ $# -ge 2 ]] ;;
+    *) false ;;
+  esac
+}
+
+bad_mode() {   # explain a rejected mode in one line instead of the whole help
+  local hint=""
+  case "${1:-}" in
+    -bg|-background|--background) hint=" (did you mean --bg?)" ;;
+    --bg) if [[ ${2:-} == -p || ${2:-} == --prompt ]]; then hint=" (missing the prompt after -p)"; else hint=" (the prompt needs -p: --bg -p \"...\")"; fi ;;
+    -prompt) hint=" (did you mean -p or --prompt?)" ;;
+    -p|--prompt) hint=" (give the prompt as one quoted argument)" ;;
+    --) hint=" (missing the command after --)" ;;
+  esac
+  die "bad mode: '$*'$hint - modes: (none) | --bg [-p \"prompt\"] | -p \"prompt\" | -- cmd... (coi-task help)"
+}
+
+# Start the agent in a task worktree in the requested mode.
+session() {
+  local wt=$1; shift
+  case "${1:-}" in
+    "")
+      claude_state add "$wt"
+      cd "$wt" && exec coi shell ;;
+    --bg)
+      claude_state add "$wt"
+      case $# in
+        1) background "$wt" ;;
+        3) [[ $2 == -p || $2 == --prompt ]] && [[ -n $3 ]] || usage 1
+           background "$wt" "$3" ;;
+        *) usage 1 ;;
+      esac ;;
+    -p|--prompt)
+      [[ $# -eq 2 && -n $2 ]] || usage 1
+      claude_state add "$wt"
+      cd "$wt" && exec coi run --prompt "$2" ;;
+    --)
+      [[ $# -ge 2 ]] || usage 1; shift
+      cd "$wt" && exec coi run -- "$@" ;;
+    *) usage 1 ;;
+  esac
+}
+
+stop_sessions() {   # stop_sessions <wt>: shut down every session of a worktree
+  local ct
+  while read -r ct; do
+    [[ -n $ct ]] || continue
+    coi shutdown "$ct" >/dev/null 2>&1 || coi kill "$ct" >/dev/null
+    say "stopped $ct"
+  done < <(containers "$1")
+}
+
+# Coi clears its immutable flags on protected paths once it sees the
+# container gone; give it a moment before removing the worktree.
+remove_worktree() {   # remove_worktree <repo> <wt> [--force]
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    git -C "$1" worktree remove "${@:3}" "$2" 2>/dev/null && return 0
+    sleep 2
+  done
+  git -C "$1" worktree remove "${@:3}" "$2"    # once more, showing the error
+}
+
+cmd_init() {
+  [[ $# -eq 1 ]] || usage 1
+  valid "$1"
+  local repo="$SRC/$1"
+  [[ -e $repo ]] && die "$repo already exists"
+  mkdir -p "$SRC"
+  git init -q -b main "$repo"
+  # Non-bare, because worktrees hang off it; updateInstead lets a push to the
+  # checked-out main update the files as well (nobody edits ~/src/<repo>).
+  git -C "$repo" config receive.denyCurrentBranch updateInstead
+  exclude_placeholders "$repo"
+  echo "coi-task: $repo ready for pushes"
+}
+
+cmd_new() {
+  [[ $# -ge 2 ]] || usage 1
+  local repo; repo=$(repo_dir "$1"); valid "$2"
+  TASK_REPO=$1 TASK_NAME=$2
+  local wt="$SRC/$1-$2" branch="agent/$2"
+  [[ -e $wt ]] && die "$wt already exists (coi-task shell $1 $2)"
+  mode_ok "${@:3}" || bad_mode "${@:3}"
+  git -C "$repo" rev-parse -q --verify HEAD >/dev/null || die "$repo has no commits yet (on the laptop: git agent sync)"
+  exclude_placeholders "$repo"
+  git -C "$repo" worktree add -q "$wt" -b "$branch"
+  shift 2
+  session "$wt" "$@"
+}
+
+cmd_shell() {
+  [[ $# -ge 2 ]] || usage 1
+  local wt; wt=$(wt_dir "$1" "$2")
+  TASK_REPO=$1 TASK_NAME=$2
+  shift 2
+  mode_ok "$@" || bad_mode "$@"
+  session "$wt" "$@"
+}
+
+cmd_attach() {
+  [[ $# -eq 2 ]] || usage 1
+  TASK_REPO=$1 TASK_NAME=$2
+  local wt ct; wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
+  exec coi attach "$ct"
+}
+
+cmd_peek() {
+  [[ $# -eq 2 || $# -eq 3 ]] || usage 1
+  local lines=${3:-40}
+  [[ $lines =~ ^[0-9]+$ ]] || usage 1
+  local wt ct; wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
+  coi tmux capture "$ct" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$lines"
+}
+
+cmd_send() {
+  [[ $# -eq 3 && -n $3 ]] || usage 1
+  local wt ct; wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
+  tmux_send "$ct" "$3"
+}
+
+cmd_stop() {
+  [[ $# -eq 2 ]] || usage 1
+  local wt; wt=$(wt_dir "$1" "$2")
+  [[ -n $(containers "$wt") ]] || { say "no running session for $wt"; return 0; }
+  stop_sessions "$wt"
+}
+
+cmd_done() {
+  [[ $# -eq 2 ]] || usage 1
+  local repo; repo=$(repo_dir "$1"); valid "$2"
+  local wt="$SRC/$1-$2" branch="agent/$2"
+  # Check BEFORE touching anything: merged means contained in main, which the
+  # laptop updates with `git agent sync` after merging. A squash or rebase
+  # merge doesn't count - use drop then.
+  if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null \
+     && ! git -C "$repo" merge-base --is-ancestor "$branch" HEAD; then
+    die "$branch is not in main - nothing removed. Merge it on the laptop and run 'git agent sync' first,
+or discard it with: coi-task drop $1 $2"
+  fi
+  if [[ -d $wt ]]; then
+    stop_sessions "$wt"
+    remove_worktree "$repo" "$wt"    # refuses if the worktree has uncommitted changes
+  fi
+  git -C "$repo" worktree prune
+  if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+    git -C "$repo" branch -q -d "$branch"
+  fi
+  claude_state del "$wt"
+  say "done: $1 $2"
+}
+
+cmd_drop() {
+  [[ $# -eq 2 || ( $# -eq 3 && $3 == -y ) ]] || usage 1
+  local repo; repo=$(repo_dir "$1"); valid "$2"
+  local wt="$SRC/$1-$2" branch="agent/$2" ahead=0
+  [[ -d $wt ]] || git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null \
+    || die "nothing to drop: no worktree $wt and no branch $branch"
+  if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+    ahead=$(git -C "$repo" rev-list --count "HEAD..$branch")
+  fi
+  if [[ ${3:-} != -y ]]; then
+    [[ -t 0 ]] || die "not a terminal: add -y to confirm"
+    local dirty=""; [[ -d $wt && -n $(git -C "$wt" status --porcelain) ]] && dirty=" and uncommitted changes"
+    read -r -p "Discard $branch ($ahead unmerged commit(s)$dirty) and its session? [y/N] " ans
+    [[ $ans == [yY]* ]] || die "nothing removed"
+  fi
+  if [[ -d $wt ]]; then
+    stop_sessions "$wt"
+    remove_worktree "$repo" "$wt" --force
+  fi
+  git -C "$repo" worktree prune
+  if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
+    git -C "$repo" branch -q -D "$branch"
+  fi
+  claude_state del "$wt"
+  say "dropped: $1 $2 (on the laptop, 'git agent list' prunes it there too)"
+}
+
+cmd_list() {
+  local r json
+  json=$(coi list --format json 2>/dev/null || echo '{}')
+  list_repo() {
+    local line wt rest ses
+    while read -r line; do
+      wt=${line%% *}; rest=${line#"$wt"}
+      ses=$(jq -r --arg w "$wt" '[.active_containers[]? | select(.workspace == $w)
+              | "\(.name) \(.status | ascii_downcase)"] | join(", ")' <<<"$json")
+      printf '%-44s %s%s\n' "$wt" "${rest# }" "${ses:+   session: $ses}"
+    done < <(git -C "$1" worktree list)
+  }
+  if [[ $# -eq 1 ]]; then list_repo "$(repo_dir "$1")"; return; fi
+  for r in "$SRC"/*/.git; do
+    [[ -d $r ]] || continue
+    list_repo "${r%/.git}"
+  done
+}
+
+case "${1:-}" in
+  init|new|shell|attach|peek|send|stop|done|drop|list) c=$1; shift; "cmd_$c" "$@" ;;
+  -h|--help|help|"") usage 0 ;;
+  *) usage 1 ;;
+esac

@@ -1,14 +1,16 @@
 # rcoi
 
 Run AI agents in [Coi](https://github.com/coipond/coi) containers on a remote
-agent host, from your laptop, over plain SSH. Two small bash scripts:
+agent host, from your laptop, over plain SSH. Three small bash scripts:
 
-- **`rcoi`**: runs `coi` (or `coi-task`) on the agent host, with Coi's own
-  command syntax: `rcoi list`, `rcoi attach <ct>`, `rcoi task new …`.
-- **`git agent`** (`git-agent`): moves code between your local repo and the
-  agent host over SSH. You push `main` there, agents commit to `agent/<task>`
-  branches, you fetch those back and review them locally. The agent host
-  needs no GitHub (or other forge) credentials.
+- **`rcoi`** (your machine): runs `coi` (or `coi-task`) on the agent host,
+  with Coi's own command syntax: `rcoi list`, `rcoi attach <ct>`, `rcoi task new …`.
+- **`git agent`** (`git-agent`, your machine): moves code between your local
+  repo and the agent host over SSH. You push `main` there, agents commit to
+  `agent/<task>` branches, you fetch those back and review them locally. The
+  agent host needs no GitHub (or other forge) credentials.
+- **`coi-task`** (agent host): one git worktree + branch + Coi session per
+  task. It starts agents in the background, types prompts in, and cleans up.
 
 ```bash
 git agent init                                   # once per repo: send it to the agent host
@@ -29,29 +31,55 @@ host and runs its `coi supervise` monitor there. `rcoi` runs it there for you:
 
 - **Your machine (Linux or macOS):** bash 3.2 or newer (macOS's built-in
   `/bin/bash` is fine, also when your shell is zsh), OpenSSH client, git.
-- **Agent host:**
-  - Coi + Incus;
-  - SSH login as the Coi user, with bash as its login shell;
-  - `coi` and `coi-task` on the PATH of a non-interactive SSH session
-    (`/usr/local/bin` is).
-- **coi-task** is the worktree-per-task helper behind `rcoi task` and
-  `git agent init`. It comes from homelab_ansible
-  (`roles/coi-agent-host/files/coi-task`, installed by the `coi-agent-host`
-  role). Plain `rcoi <coi command>` only needs Coi.
+- **Agent host (Linux):**
+  - Coi + Incus, working for the user you log in as (`coi shell` works there);
+    tested with Coi v0.16.0;
+  - git, jq and flock (util-linux);
+  - SSH login as that user, with a key, and bash as its login shell.
 
 ## Install
 
-From this folder (copy it to the machine first, e.g. `scp -r` or `git clone`):
+Get this folder onto both machines (`git clone`, or `scp -r`).
+
+### 1. Agent host
 
 ```bash
-./install.sh --host sisio@agents-vm01.home.kolsut.net
+./install.sh --agent-host
+```
+
+This installs `coi-task` into `/usr/local/bin`, using sudo if that directory
+isn't writable. That directory is on the PATH of non-interactive SSH sessions,
+which is how rcoi calls it. It then checks that coi, incus, git, jq and flock
+are there.
+
+Configure Coi so agents can work on their own. Minimal `~/.coi/config.toml`:
+
+```toml
+[tool]
+name = "claude"
+permission_mode = "bypass"     # the agent edits and commits without asking (it's in a container)
+
+[defaults.env_commands]
+# Claude's login token, read when a session starts.
+# Create one with `claude setup-token`, store it with mode 0600.
+CLAUDE_CODE_OAUTH_TOKEN = "cat /home/you/.config/coi-secrets/claude_token"
+```
+
+Without `permission_mode = "bypass"`, an agent started in the background
+asks before each write, and nobody is there to answer. Network limits,
+memory limits, protected branches and so on are up to you. See Coi's docs.
+
+### 2. Your machine
+
+```bash
+./install.sh --host you@agent-host
 ```
 
 It installs `rcoi` and `git-agent` into `~/.local/bin` (no sudo) and writes
 the host into `~/.config/rcoi/host`. It then checks:
 - that `~/.local/bin` is on your PATH, and prints the line to add if it isn't;
 - that SSH logs in without a password, and suggests `ssh-copy-id` if it doesn't;
-- that `coi` and `coi-task` are found on the host.
+- that `coi` and `coi-task` are found on the agent host.
 
 On **macOS**, `~/.local/bin` isn't on the PATH by default. Add it to
 `~/.zshrc` (install.sh prints the exact line) and open a new terminal:
@@ -63,8 +91,8 @@ export PATH="$HOME/.local/bin:$PATH"
 Then:
 
 ```bash
-rcoi version          # Coi's version, from the host
-rcoi task list        # task worktrees on the host
+rcoi version          # Coi's version, from the agent host
+rcoi task list        # task worktrees on the agent host
 git agent help
 ```
 
@@ -72,10 +100,12 @@ git agent help
 |---|---|
 | `./install.sh` | update the scripts, keep the host setting |
 | `--host user@host` | set (or change) the agent host |
-| `--prefix DIR` | install somewhere else, e.g. `/usr/local/bin` (needs write access there) |
+| `--agent-host` | install `coi-task` instead (run on the agent host) |
+| `--prefix DIR` | install somewhere else |
 | `--uninstall` | remove the scripts; `~/.config/rcoi/host` stays |
 
-To update later: replace this folder with the new version and run `./install.sh` again.
+To update: get the new version of this folder and run `./install.sh` again
+(on each machine, with `--agent-host` there).
 
 ### Settings
 
@@ -85,20 +115,22 @@ To update later: replace this folder with the new version and run `./install.sh`
 | Extra SSH options for rcoi | `RCOI_SSH_OPTS="-p 2222 -i ~/.ssh/agent"` (word-split) |
 | git agent's remote name | `AGENTVM_REMOTE` (default `agentvm`) |
 | Branch agents start from | `AGENTVM_BASE` (default `main`) |
+| Where repos live on the agent host | `COI_TASK_SRC` (default `~/src`; `git agent init` assumes `~/src`) |
+| How long `--bg -p` waits for the agent | `COI_TASK_READY_TIMEOUT` seconds (default 180) |
 
-SSH keys or Kerberos must log in **without a password prompt**, because
+SSH must log in **without a password prompt** (key or Kerberos), because
 `git agent` and pipes need that. Interactive `rcoi` works either way. SSH
 options for `git agent` go into `~/.ssh/config` (a `Host` entry), since git
 calls ssh itself.
 
 ## Workflow
 
-Run everything on your machine, inside your repo (here `~/Projects/myrepo`,
+Run everything on your machine, inside your repo (here `~/code/myrepo`,
 task `sum`). The task name is what you use in every later command.
 
 **1. Send the repo to the agent host (once per repo)**
 ```bash
-cd ~/Projects/myrepo
+cd ~/code/myrepo
 git agent init        # creates ~/src/myrepo on the host, adds the 'agentvm' remote, pushes main
 git agent sync        # later: push your new main there, so new tasks start from it
 ```
@@ -172,7 +204,6 @@ so look before you overwrite it.
 
 ## rcoi usage
 
-
 ```
 rcoi <coi args...>     coi <coi args...> on the host
 rcoi task <args...>    coi-task <args...> on the host
@@ -183,7 +214,7 @@ rcoi help              rcoi's help (rcoi --help is Coi's own help)
 Paths you pass to Coi are **host** paths. Arguments arrive literally, so the
 remote side never expands `~` or `$VARS`, while your local shell expands an
 unquoted `~` to your **laptop** home. That only works if both homes match. So pass
-absolute host paths (`rcoi shell -w /home/sisio/src/myrepo-fix --background`),
+absolute host paths (`rcoi shell -w /home/you/src/myrepo-fix --background`),
 or use `rcoi task`, which works with repo and task names instead of paths.
 
 ### Background agents you can watch and take over
@@ -258,6 +289,10 @@ the same as the task commands.
   `rcoi task list` shows `frozen`. See `rcoi audit` / `rcoi logs <ct>`.
 
 ## Security
+
+Agents run with Coi's isolation, and with whatever access you give them in
+`~/.coi/config.toml` (network mode, env vars, mounted secrets). `bypass` only
+means they don't ask before acting inside their container.
 
 `rcoi` adds no access of its own. It's an SSH login as the Coi user plus one
 command. Whoever can run `rcoi` against a host can already SSH to it.
