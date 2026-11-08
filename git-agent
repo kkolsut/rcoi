@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# git agent - move code between this repo and the agent host over SSH.
+# Run inside a repo on your machine. `git agent help` for the commands.
+# Part of rcoi (install.sh installs both).
+#
+# The agent host is just a second git remote ("agentvm"): you push main to
+# it, agents commit to agent/<task> branches there (rcoi task new), you fetch
+# those back and review them here. Your other remotes (e.g. GitHub) only see
+# what you push to them yourself.
+set -euo pipefail
+
+die() { echo "git agent: $*" >&2; exit 1; }
+
+# Same host as rcoi: $AGENTVM_HOST, else $RCOI_HOST, else ~/.config/rcoi/host.
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/rcoi/host"
+HOST=${AGENTVM_HOST:-${RCOI_HOST:-}}
+if [[ -z $HOST && -r $conf ]]; then
+  read -r HOST <"$conf" || true
+fi
+REMOTE=${AGENTVM_REMOTE:-agentvm}
+BASE=${AGENTVM_BASE:-main}
+
+usage() {
+  cat <<EOF
+usage: git agent <command> [task]
+
+  init          create ~/src/<repo> on the agent host, add the '$REMOTE' remote, push $BASE
+  sync          push $BASE to the agent host (agents start new tasks from it)
+  list          fetch and list the agent branches (newest first)
+  diff <task>   what the agent changed since it branched off $BASE
+  log  <task>   the same, commit by commit
+  try  <task>   check it out as review/<task> (this runs the agent's code: read the diff first)
+  merge <task>  merge it into $BASE (then: git push origin $BASE && git agent sync)
+
+  <task> is the name given to 'rcoi task new <repo> <task>'.
+  Host: ${HOST:-<not set>} (AGENTVM_HOST, RCOI_HOST or $conf).
+  Env: AGENTVM_REMOTE ($REMOTE), AGENTVM_BASE ($BASE).
+EOF
+}
+
+case ${1:-help} in help|-h|--help) usage; exit 0 ;; esac
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repo"
+cd "$top"
+repo=$(basename "$top")
+
+need_remote() {
+  git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no '$REMOTE' remote here; run: git agent init"
+}
+
+branch() {
+  [ -n "${1:-}" ] || die "missing task name (see: git agent list)"
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "bad task name: $1"
+  need_remote
+  git fetch -q --prune "$REMOTE"
+  local ref="refs/remotes/$REMOTE/agent/$1"
+  git rev-parse -q --verify "$ref" >/dev/null || die "no branch agent/$1 on the agent host (see: git agent list)"
+  echo "$REMOTE/agent/$1"
+}
+
+cmd=${1:-help}
+shift || true
+
+case $cmd in
+  init)
+    [[ $repo =~ ^[A-Za-z0-9._-]+$ && $repo != .* ]] || die "repo dir name '$repo' is not a safe name"
+    git remote get-url "$REMOTE" >/dev/null 2>&1 && die "remote '$REMOTE' already exists: $(git remote get-url "$REMOTE")"
+    git rev-parse -q --verify "refs/heads/$BASE" >/dev/null || die "no local branch $BASE to push"
+    [[ -n $HOST ]] || die "no agent host: put user@host into $conf (or set RCOI_HOST)"
+    # coi-task (on the agent host) makes ~/src/<repo> accept pushes to its
+    # checked-out main.
+    # shellcheck disable=SC2029  # expands here on purpose; $repo is validated above
+    ssh "$HOST" coi-task init "$repo"
+    git remote add "$REMOTE" "$HOST:src/$repo"
+    # Fetch only the agent branches: agents could move other refs in the host's
+    # repo (e.g. main), and those should never show up here.
+    git config "remote.$REMOTE.fetch" "+refs/heads/agent/*:refs/remotes/$REMOTE/agent/*"
+    git push -q "$REMOTE" "$BASE"
+    echo "ready: rcoi task new $repo <task> --bg -p \"<prompt>\""
+    ;;
+  sync)
+    # Plain push, never forced: if it's rejected, main on the agent host was moved
+    # (by an agent?) - look before you overwrite it.
+    need_remote
+    git push "$REMOTE" "$BASE"
+    ;;
+  list)
+    need_remote
+    git fetch -q --prune "$REMOTE"
+    out=$(git for-each-ref --sort=-committerdate \
+            --format='%(refname:lstrip=4)%09%(committerdate:relative)%09%(subject)' \
+            "refs/remotes/$REMOTE/agent/")
+    if [ -z "$out" ]; then echo "no agent branches on the agent host"; else column -t -s $'\t' <<<"$out"; fi
+    ;;
+  diff)
+    b=$(branch "${1:-}"); git diff "$BASE...$b"
+    ;;
+  log)
+    b=$(branch "${1:-}"); git log -p "$BASE..$b"
+    ;;
+  try)
+    b=$(branch "${1:-}"); git switch -c "review/$1" "$b"
+    ;;
+  merge)
+    b=$(branch "${1:-}")
+    git switch -q "$BASE"
+    git merge --no-ff -m "Merge agent/$1" "$b"
+    echo "next: git push origin $BASE && git agent sync && rcoi task done $repo $1"
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2; exit 2
+    ;;
+esac

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# rcoi - run Coi (https://github.com/coipond/coi) on a remote agent host over SSH.
+#
+#   rcoi <coi args...>        coi <coi args...> on the host, e.g.
+#                             rcoi list | rcoi attach <ct> | rcoi tmux capture <ct>
+#   rcoi task <args...>       coi-task <args...> on the host (worktree-per-task helper)
+#   rcoi host                 print the configured host
+#   rcoi help                 this help (rcoi --help is Coi's own help)
+#
+# Host: $RCOI_HOST, else the first line of ~/.config/rcoi/host (user@host).
+# Extra ssh options: $RCOI_SSH_OPTS (word-split), e.g. "-p 2222".
+# Every argument reaches the remote command exactly as given (no re-splitting),
+# so prompts with spaces, quotes or $ are safe. The remote shell must be bash.
+set -euo pipefail
+
+die() { echo "rcoi: $*" >&2; exit 1; }
+usage() { sed -n '2,13s/^# \{0,1\}//p' "$0"; }
+
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/rcoi/host"
+host=${RCOI_HOST:-}
+if [[ -z $host && -r $conf ]]; then
+  read -r host <"$conf" || true
+fi
+
+case "${1:-}" in
+  ""|help) usage; exit 0 ;;
+  host)
+    [[ -n $host ]] || die "no host configured"
+    echo "$host"; exit 0 ;;
+  task) shift; remote=(coi-task "$@") ;;
+  *) remote=(coi "$@") ;;
+esac
+
+[[ -n $host ]] || die "no host: set RCOI_HOST or put user@host into $conf"
+
+# A real terminal only when we have one: attach and interactive shells need
+# it, while `rcoi list | grep ...` must stay a clean pipe (no CRs).
+if [[ -t 0 && -t 1 ]]; then tty=-t; else tty=-T; fi
+
+# ssh joins its arguments into one command line for the remote shell, so
+# quote each word for it; %q output is what bash reads back unchanged.
+printf -v cmd '%q ' "${remote[@]}"
+
+# LogLevel=ERROR hides "Connection to ... closed." after every -t session.
+# shellcheck disable=SC2086  # RCOI_SSH_OPTS is meant to be word-split
+exec ssh "$tty" -o LogLevel=ERROR ${RCOI_SSH_OPTS:-} "$host" "$cmd"
