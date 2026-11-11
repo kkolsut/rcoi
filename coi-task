@@ -3,13 +3,18 @@
 # Repos live in ~/src; a task gets ~/src/<repo>-<task> on branch agent/<task>.
 #
 #   coi-task init   <repo>                 empty ~/src/<repo> that accepts pushes (run by `git agent init`)
-#   coi-task new    <repo> <task> [mode]   worktree ~/src/<repo>-<task> on agent/<task>, then start the agent
-#   coi-task shell  <repo> <task> [mode]   the same in an existing task worktree
+#   coi-task new    <repo> <task> [--profile P] [mode]
+#                                          worktree ~/src/<repo>-<task> on agent/<task>, then start the agent
+#   coi-task shell  <repo> <task> [--profile P] [mode]
+#                                          the same in an existing task worktree
+#     --profile P   Coi profile for the session (~/.coi/profiles/P), e.g. codex for the
+#                   Codex agent or another Claude account; remembered for the task
 #     modes:  (none)        interactive coi shell (reattaches if the task's session is running)
 #             --bg [-p "prompt"]
 #                           background session (tmux), optionally typing the prompt into it;
 #                           with a running session, --bg -p just sends the prompt
 #             -p "prompt"   headless one-shot run (coi run --prompt), output when it ends
+#                           (Claude only: Coi has no headless mode for Codex, use --bg -p)
 #             -- cmd...     plain command (coi run; no agent settings, so no write permission)
 #   coi-task attach <repo> <task>          attach to the background session (detach: Ctrl+B, then d)
 #   coi-task peek   <repo> <task> [lines]  print the session's screen (default 40 lines)
@@ -29,6 +34,7 @@ SRC="${COI_TASK_SRC:-$HOME/src}"
 CLAUDE_STATE="$HOME/.claude.json"
 READY_TIMEOUT="${COI_TASK_READY_TIMEOUT:-180}"
 TASK_REPO="" TASK_NAME=""   # set by new/shell for the hints background() prints
+COI=(coi)                   # coi, plus --profile P when the task has one
 
 # Coi bind-mounts these read-only into every session and leaves empty
 # placeholders behind in the workspace. Untracked, they would end up in an
@@ -38,7 +44,8 @@ PLACEHOLDERS=(/.husky/ /.vscode/ /.claude/settings.json /.claude/settings.local.
 
 die() { echo "coi-task: $*" >&2; exit 1; }
 say() { echo "coi-task: $*" >&2; }
-usage() { sed -n '2,25s/^# \{0,1\}//p' "$0"; exit "${1:-0}"; }
+# The help is the comment block at the top of this file.
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit "${1:-0}"; }
 
 valid() {   # repo and task names end up in paths and branch names
   [[ $1 =~ ^[A-Za-z0-9._-]+$ && $1 != .* ]] || die "invalid name: '$1'"
@@ -94,10 +101,18 @@ claude_state() {   # claude_state add|del <path>
   ) 9>"$CLAUDE_STATE.lock"
 }
 
+# Coi containers as "name<TAB>status<TAB>workspace" lines. Read from Incus,
+# not `coi list`: that only knows the workspaces of the configured tool's
+# sessions, so a session started with another tool's profile (codex) would
+# show up without one.
+sessions() {
+  incus list --format json | jq -r '.[] | select(.name | startswith("coi-"))
+    | [.name, (.status | ascii_downcase), (.devices.workspace.source // "")] | @tsv'
+}
+
 # Running/frozen containers of a workspace, one per line (normally one).
 containers() {
-  coi list --format json | jq -r --arg w "$1" \
-    '.active_containers[]? | select(.workspace == $w) | .name'
+  sessions | awk -F'\t' -v w="$1" '$3 == w && ($2 == "running" || $2 == "frozen") { print $1 }'
 }
 container() {   # the first one, or die
   local ct; ct=$(containers "$1" | head -1)
@@ -118,14 +133,19 @@ tmux_send() {   # tmux_send <container> <text>
   incus exec -T "$ct" --user 1000 -- tmux send-keys -t "$target" Enter </dev/null
 }
 
-wait_ready() {   # wait until Claude shows its input box
+# Wait until the agent shows its input box: Claude's footer says "bypass
+# permissions" / "for shortcuts", Codex's says how much context is left.
+wait_ready() {
   local ct=$1 i screen
   for ((i = 0; i < READY_TIMEOUT; i += 2)); do
     screen=$(coi tmux capture "$ct" 2>/dev/null || true)
     if grep -q 'trust this folder' <<<"$screen"; then
       die "$ct is asking to trust the folder - answer it with: coi attach $ct"
     fi
-    grep -qE 'bypass permissions|for shortcuts' <<<"$screen" && return 0
+    if grep -qE 'Sign in with ChatGPT|Sign in with Device Code' <<<"$screen"; then
+      die "$ct: Codex is not logged in on this host (~/.codex/auth.json) - log in, or answer it with: coi attach $ct"
+    fi
+    grep -qE 'bypass permissions|for shortcuts|context left' <<<"$screen" && return 0
     sleep 2
   done
   die "$ct: agent not ready after ${READY_TIMEOUT}s - look with: coi attach $ct"
@@ -137,7 +157,7 @@ background() {   # background <wt> [prompt]
   if [[ -z $ct ]]; then
     # Coi's setup output is long; keep it in a log and show it only on failure.
     local log; log=$(mktemp "${TMPDIR:-/tmp}/coi-task-bg.XXXXXX")
-    if ! (cd "$wt" && coi shell --background) >"$log" 2>&1; then
+    if ! (cd "$wt" && "${COI[@]}" shell --background) >"$log" 2>&1; then
       tail -n 30 "$log" >&2; rm -f "$log"
       die "coi shell --background failed in $wt"
     fi
@@ -189,7 +209,7 @@ session() {
   case "${1:-}" in
     "")
       claude_state add "$wt"
-      cd "$wt" && exec coi shell ;;
+      cd "$wt" && exec "${COI[@]}" shell ;;
     --bg)
       claude_state add "$wt"
       case $# in
@@ -201,10 +221,10 @@ session() {
     -p|--prompt)
       [[ $# -eq 2 && -n $2 ]] || usage 1
       claude_state add "$wt"
-      cd "$wt" && exec coi run --prompt "$2" ;;
+      cd "$wt" && exec "${COI[@]}" run --prompt "$2" ;;
     --)
       [[ $# -ge 2 ]] || usage 1; shift
-      cd "$wt" && exec coi run -- "$@" ;;
+      cd "$wt" && exec "${COI[@]}" run -- "$@" ;;
     *) usage 1 ;;
   esac
 }
@@ -229,6 +249,30 @@ remove_worktree() {   # remove_worktree <repo> <wt> [--force]
   git -C "$1" worktree remove "${@:3}" "$2"    # once more, showing the error
 }
 
+# The task's Coi profile lives in the repo's git config (coi-task.<task>.profile),
+# so `shell` reuses what `new` was given. use_profile <repo dir> <task> [P]
+use_profile() {
+  local key="coi-task.$2.profile" p=${3:-}
+  if [[ -n $p ]]; then
+    [[ $p =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid profile name: '$p'"
+    git -C "$1" config "$key" "$p"
+  else
+    p=$(git -C "$1" config --get "$key" || true)
+  fi
+  if [[ -n $p ]]; then COI=(coi --profile "$p"); fi
+}
+forget_profile() { git -C "$1" config --remove-section "coi-task.$2" 2>/dev/null || true; }
+
+# Pull "--profile P" off the front of new/shell's remaining arguments.
+# Sets PROFILE_ARG and ARGS (the mode).
+split_profile() {
+  PROFILE_ARG=""; ARGS=("$@")
+  if [[ ${1:-} == --profile ]]; then
+    [[ $# -ge 2 && -n $2 ]] || die "--profile needs a name (a directory in ~/.coi/profiles)"
+    PROFILE_ARG=$2; ARGS=("${@:3}")
+  fi
+}
+
 cmd_init() {
   [[ $# -eq 1 ]] || usage 1
   valid "$1"
@@ -249,21 +293,24 @@ cmd_new() {
   TASK_REPO=$1 TASK_NAME=$2
   local wt="$SRC/$1-$2" branch="agent/$2"
   [[ -e $wt ]] && die "$wt already exists (coi-task shell $1 $2)"
-  mode_ok "${@:3}" || bad_mode "${@:3}"
+  split_profile "${@:3}"
+  mode_ok ${ARGS[@]+"${ARGS[@]}"} || bad_mode ${ARGS[@]+"${ARGS[@]}"}
   git -C "$repo" rev-parse -q --verify HEAD >/dev/null || die "$repo has no commits yet (on the laptop: git agent sync)"
   exclude_placeholders "$repo"
   git -C "$repo" worktree add -q "$wt" -b "$branch"
-  shift 2
-  session "$wt" "$@"
+  forget_profile "$repo" "$2"    # a leftover from an earlier task of the same name
+  use_profile "$repo" "$2" "$PROFILE_ARG"
+  session "$wt" ${ARGS[@]+"${ARGS[@]}"}
 }
 
 cmd_shell() {
   [[ $# -ge 2 ]] || usage 1
   local wt; wt=$(wt_dir "$1" "$2")
   TASK_REPO=$1 TASK_NAME=$2
-  shift 2
-  mode_ok "$@" || bad_mode "$@"
-  session "$wt" "$@"
+  split_profile "${@:3}"
+  mode_ok ${ARGS[@]+"${ARGS[@]}"} || bad_mode ${ARGS[@]+"${ARGS[@]}"}
+  use_profile "$SRC/$1" "$2" "$PROFILE_ARG"
+  session "$wt" ${ARGS[@]+"${ARGS[@]}"}
 }
 
 cmd_attach() {
@@ -314,6 +361,7 @@ or discard it with: coi-task drop $1 $2"
   if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
     git -C "$repo" branch -q -d "$branch"
   fi
+  forget_profile "$repo" "$2"
   claude_state del "$wt"
   say "done: $1 $2"
 }
@@ -341,20 +389,25 @@ cmd_drop() {
   if git -C "$repo" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
     git -C "$repo" branch -q -D "$branch"
   fi
+  forget_profile "$repo" "$2"
   claude_state del "$wt"
   say "dropped: $1 $2 (on the laptop, 'git agent list' prunes it there too)"
 }
 
 cmd_list() {
-  local r json
-  json=$(coi list --format json 2>/dev/null || echo '{}')
+  local r all
+  all=$(sessions 2>/dev/null || true)
   list_repo() {
-    local line wt rest ses
+    local line wt rest ses prof task
     while read -r line; do
       wt=${line%% *}; rest=${line#"$wt"}
-      ses=$(jq -r --arg w "$wt" '[.active_containers[]? | select(.workspace == $w)
-              | "\(.name) \(.status | ascii_downcase)"] | join(", ")' <<<"$json")
-      printf '%-44s %s%s\n' "$wt" "${rest# }" "${ses:+   session: $ses}"
+      ses=$(awk -F'\t' -v w="$wt" '$3 == w { printf "%s%s %s", (n++ ? ", " : ""), $1, $2 }' <<<"$all")
+      prof=""
+      if [[ $wt == "$1"-* ]]; then
+        task=${wt#"$1"-}
+        prof=$(git -C "$1" config --get "coi-task.$task.profile" || true)
+      fi
+      printf '%-44s %s%s%s\n' "$wt" "${rest# }" "${prof:+   profile: $prof}" "${ses:+   session: $ses}"
     done < <(git -C "$1" worktree list)
   }
   if [[ $# -eq 1 ]]; then list_repo "$(repo_dir "$1")"; return; fi
