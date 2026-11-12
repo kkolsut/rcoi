@@ -27,6 +27,8 @@ usage: git agent <command> [task]
   init          create ~/src/<repo> on the agent host, add the '$REMOTE' remote, push $BASE
   connect       only add the '$REMOTE' remote, for a repo already on the agent host
                 (init was run on another machine)
+  remove [-y]   delete ~/src/<repo> and its tasks on the agent host, then the '$REMOTE' remote
+                (asks first; unmerged agent branches there are lost)
   sync          push $BASE to the agent host (agents start new tasks from it)
   list          fetch and list the agent branches (newest first)
   diff <task>   what the agent changed since it branched off $BASE
@@ -111,6 +113,24 @@ case $cmd in
     fi
     echo "connected to $HOST:src/$repo ($note)"
     "$0" list
+    ;;
+  remove)
+    [[ $# -eq 0 || ( $# -eq 1 && $1 == -y ) ]] || die "usage: git agent remove [-y]"
+    [[ $repo =~ ^[A-Za-z0-9._-]+$ && $repo != .* ]] || die "repo dir name '$repo' is not a safe name"
+    [[ -n $HOST ]] || die "no agent host: put user@host into $conf (or set RCOI_HOST)"
+    target="$HOST:src/$repo"
+    if url=$(git remote get-url "$REMOTE" 2>/dev/null) && [[ $url != "$target" ]]; then
+      die "remote '$REMOTE' is $url, not $target - remove it by hand"
+    fi
+    # A terminal for coi-task's confirmation prompt (unless -y).
+    if [[ -t 0 && -t 1 ]]; then tty=-t; else tty=-T; fi
+    # shellcheck disable=SC2029  # expands here on purpose; $repo is validated above
+    ssh "$tty" -o LogLevel=ERROR "$HOST" coi-task remove "$repo" "$@" \
+      || die "nothing removed here (already gone from the host? then just: git remote remove $REMOTE)"
+    if git remote get-url "$REMOTE" >/dev/null 2>&1; then
+      git remote remove "$REMOTE"
+      echo "removed the '$REMOTE' remote"
+    fi
     ;;
   sync)
     # Plain push, never forced: if it's rejected, main on the agent host was moved

@@ -209,6 +209,12 @@ git switch main && git branch -D review/sum    # only if you used try
 git agent list                 # drops agentvm/agent/sum locally too
 ```
 
+**7. Remove the repo from the agent host** (when you're done with it there)
+```bash
+git agent remove               # lists its tasks + unmerged branches, asks, then deletes
+                               # ~/src/myrepo and its task worktrees, and the 'agentvm' remote
+```
+
 **Pause and resume:** `rcoi task stop myrepo sum` ends the session but keeps
 the worktree and commits. Start it again with
 `rcoi task shell myrepo sum --bg -p "Continue where you left off."`
@@ -418,12 +424,14 @@ stop   <repo> <task>                         end the session, keep the worktree
 done   <repo> <task>                         stop + remove worktree + branch (merged only)
 drop   <repo> <task> [-y]                    the same, discarding unmerged work
 list   [<repo>]                              tasks, sessions, profiles
+remove <repo> [-y]                           drop every task, delete ~/src/<repo> (git agent remove)
 ```
 
 **`git agent`**
 ```
 git agent init          create ~/src/<repo> on the agent host, add the 'agentvm' remote, push main
 git agent connect       only add the 'agentvm' remote (repo already on the host, e.g. init from another machine)
+git agent remove [-y]   delete ~/src/<repo> + its tasks on the host, then the 'agentvm' remote (asks first)
 git agent sync          push main to the agent host (never forced)
 git agent list          fetch and list the agent branches (newest first)
 git agent diff <task>   what the agent changed since it branched off main

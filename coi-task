@@ -23,6 +23,7 @@
 #   coi-task done   <repo> <task>          stop + remove the worktree + delete agent/<task> (merged only)
 #   coi-task drop   <repo> <task> [-y]     the same for unmerged work: discards it (asks first)
 #   coi-task list   [<repo>]               task worktrees and their sessions
+#   coi-task remove <repo> [-y]            drop every task, then delete ~/src/<repo> (run by `git agent remove`)
 #
 # Code arrives from the laptop over SSH (`git agent init` / `git agent sync`
 # push main here) and goes back the same way (`git agent list` fetches the
@@ -394,6 +395,40 @@ cmd_drop() {
   say "dropped: $1 $2 (on the laptop, 'git agent list' prunes it there too)"
 }
 
+cmd_remove() {
+  [[ $# -eq 1 || ( $# -eq 2 && $2 == -y ) ]] || usage 1
+  local repo; repo=$(repo_dir "$1")
+  local wt wts=() b unmerged=()
+  # Task worktrees: all but the first entry, which is the repo itself.
+  while read -r wt; do
+    wts+=("$wt")
+  done < <(git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | tail -n +2)
+  # Agent branches not in main are work that exists only here.
+  while read -r b; do
+    [[ -n $b ]] || continue
+    git -C "$repo" merge-base --is-ancestor "$b" HEAD 2>/dev/null || unmerged+=("$b")
+  done < <(git -C "$repo" for-each-ref --format='%(refname:lstrip=2)' refs/heads/agent/)
+  if [[ ${2:-} != -y ]]; then
+    [[ -t 0 ]] || die "not a terminal: add -y to confirm"
+    echo "Remove $repo from this host?"
+    if ((${#wts[@]})); then printf '  task worktree (session stopped, changes lost): %s\n' "${wts[@]}"; fi
+    if ((${#unmerged[@]})); then printf '  unmerged branch (fetch it first: git agent list): %s\n' "${unmerged[@]}"; fi
+    read -r -p "[y/N] " ans
+    [[ $ans == [yY]* ]] || die "nothing removed"
+  fi
+  # Worktrees first, the usual way (stop the session, wait for Coi to release
+  # its protected paths); if one can't be removed, stop before deleting anything.
+  for wt in ${wts[@]+"${wts[@]}"}; do
+    stop_sessions "$wt"
+    if [[ -d $wt ]]; then remove_worktree "$repo" "$wt" --force; fi
+    claude_state del "$wt"
+    say "removed $wt"
+  done
+  stop_sessions "$repo"
+  rm -rf -- "$repo"
+  say "removed $repo"
+}
+
 cmd_list() {
   local r all
   all=$(sessions 2>/dev/null || true)
@@ -418,7 +453,7 @@ cmd_list() {
 }
 
 case "${1:-}" in
-  init|new|shell|attach|peek|send|stop|done|drop|list) c=$1; shift; "cmd_$c" "$@" ;;
+  init|new|shell|attach|peek|send|stop|done|drop|list|remove) c=$1; shift; "cmd_$c" "$@" ;;
   -h|--help|help|"") usage 0 ;;
   *) usage 1 ;;
 esac
