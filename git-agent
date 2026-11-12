@@ -122,11 +122,15 @@ case $cmd in
     if url=$(git remote get-url "$REMOTE" 2>/dev/null) && [[ $url != "$target" ]]; then
       die "remote '$REMOTE' is $url, not $target - remove it by hand"
     fi
+    # An older coi-task answers an unknown command with its help (and exit 1),
+    # which would look like "repo not there"; say what's actually wrong.
+    ssh -o LogLevel=ERROR "$HOST" coi-task help 2>/dev/null | grep -q 'coi-task remove' \
+      || die "coi-task on $HOST has no 'remove' (too old, or unreachable): update it there with ./install.sh --agent-host"
     # A terminal for coi-task's confirmation prompt (unless -y).
     if [[ -t 0 && -t 1 ]]; then tty=-t; else tty=-T; fi
     # shellcheck disable=SC2029  # expands here on purpose; $repo is validated above
     ssh "$tty" -o LogLevel=ERROR "$HOST" coi-task remove "$repo" "$@" \
-      || die "nothing removed here (already gone from the host? then just: git remote remove $REMOTE)"
+      || die "removing on $HOST failed or was cancelled (see above); the '$REMOTE' remote is kept"
     if git remote get-url "$REMOTE" >/dev/null 2>&1; then
       git remote remove "$REMOTE"
       echo "removed the '$REMOTE' remote"
