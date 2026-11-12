@@ -148,6 +148,9 @@ rcoi task done myrepo sum      # stop the session, remove worktree + branch on t
 git agent init        # once per repo
 git agent sync        # after each new commit on main, so new tasks start from it
 ```
+> Second machine? The repo is already on the agent host, so use
+> `git agent connect` there instead of `init`: it only adds the remote.
+
 > A task starts from whatever `main` is **on the agent host**. If you forget
 > `git agent sync`, the agent works on stale code.
 
@@ -420,6 +423,7 @@ list   [<repo>]                              tasks, sessions, profiles
 **`git agent`**
 ```
 git agent init          create ~/src/<repo> on the agent host, add the 'agentvm' remote, push main
+git agent connect       only add the 'agentvm' remote (repo already on the host, e.g. init from another machine)
 git agent sync          push main to the agent host (never forced)
 git agent list          fetch and list the agent branches (newest first)
 git agent diff <task>   what the agent changed since it branched off main
@@ -468,6 +472,7 @@ calls ssh itself.
 | `--bg -p` says "asking to trust the folder" | Trust was not pre-set. Attach and answer it (`rcoi task attach`). For Codex, check the host's `~/.codex/config.toml` has the repo root. |
 | "Codex is not logged in" | `~/.codex/auth.json` is missing or expired on the host. See [Codex](#codex). |
 | "agent not ready after 180s" | Look with `rcoi task attach`. `COI_TASK_READY_TIMEOUT` raises the wait. |
+| `git agent init`: "already exists" | The repo is on the host already (init from another machine). Use `git agent connect`. |
 | The agent worked on old code | You forgot `git agent sync` before `task new`. |
 | `task done` refuses | The branch isn't merged. Merge it (`git agent merge`) or use `drop`. |
 | Wrong model | `rcoi task peek <repo> <task> 10` shows it. Check the task's profile in `rcoi task list`. |

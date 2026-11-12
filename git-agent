@@ -25,6 +25,8 @@ usage() {
 usage: git agent <command> [task]
 
   init          create ~/src/<repo> on the agent host, add the '$REMOTE' remote, push $BASE
+  connect       only add the '$REMOTE' remote, for a repo already on the agent host
+                (init was run on another machine)
   sync          push $BASE to the agent host (agents start new tasks from it)
   list          fetch and list the agent branches (newest first)
   diff <task>   what the agent changed since it branched off $BASE
@@ -61,22 +63,54 @@ branch() {
 cmd=${1:-help}
 shift || true
 
+# Checks shared by init and connect.
+precheck() {
+  [[ $repo =~ ^[A-Za-z0-9._-]+$ && $repo != .* ]] || die "repo dir name '$repo' is not a safe name"
+  git remote get-url "$REMOTE" >/dev/null 2>&1 && die "remote '$REMOTE' already exists: $(git remote get-url "$REMOTE")"
+  [[ -n $HOST ]] || die "no agent host: put user@host into $conf (or set RCOI_HOST)"
+}
+
+add_remote() {
+  git remote add "$REMOTE" "$HOST:src/$repo"
+  # Fetch only the agent branches: agents could move other refs in the host's
+  # repo (e.g. main), and those should never show up here.
+  git config "remote.$REMOTE.fetch" "+refs/heads/agent/*:refs/remotes/$REMOTE/agent/*"
+}
+
 case $cmd in
   init)
-    [[ $repo =~ ^[A-Za-z0-9._-]+$ && $repo != .* ]] || die "repo dir name '$repo' is not a safe name"
-    git remote get-url "$REMOTE" >/dev/null 2>&1 && die "remote '$REMOTE' already exists: $(git remote get-url "$REMOTE")"
+    precheck
     git rev-parse -q --verify "refs/heads/$BASE" >/dev/null || die "no local branch $BASE to push"
-    [[ -n $HOST ]] || die "no agent host: put user@host into $conf (or set RCOI_HOST)"
     # coi-task (on the agent host) makes ~/src/<repo> accept pushes to its
     # checked-out main.
     # shellcheck disable=SC2029  # expands here on purpose; $repo is validated above
-    ssh "$HOST" coi-task init "$repo"
-    git remote add "$REMOTE" "$HOST:src/$repo"
-    # Fetch only the agent branches: agents could move other refs in the host's
-    # repo (e.g. main), and those should never show up here.
-    git config "remote.$REMOTE.fetch" "+refs/heads/agent/*:refs/remotes/$REMOTE/agent/*"
+    ssh "$HOST" coi-task init "$repo" || die "init on the agent host failed (if ~/src/$repo is already there from another machine: git agent connect)"
+    add_remote
     git push -q "$REMOTE" "$BASE"
     echo "ready: rcoi task new $repo <task> --bg -p \"<prompt>\""
+    ;;
+  connect)
+    precheck
+    # Nothing is created or pushed: just check the host's repo is there.
+    git ls-remote -q --exit-code "$HOST:src/$repo" "refs/heads/$BASE" >/dev/null \
+      || die "no $BASE in src/$repo on $HOST (new repo there? use: git agent init)"
+    add_remote
+    git fetch -q "$REMOTE"
+    # Tell how this main relates to the host's, so sync doesn't surprise.
+    host_base=$(git ls-remote -q "$REMOTE" "refs/heads/$BASE" | cut -f1)
+    if ! git rev-parse -q --verify "refs/heads/$BASE" >/dev/null; then
+      note="no local $BASE yet"
+    elif [[ $(git rev-parse "refs/heads/$BASE") == "$host_base" ]]; then
+      note="$BASE matches the agent host"
+    elif git merge-base --is-ancestor "$host_base" "refs/heads/$BASE" 2>/dev/null; then
+      note="$BASE is ahead of the agent host: git agent sync"
+    elif git merge-base --is-ancestor "refs/heads/$BASE" "$host_base" 2>/dev/null; then
+      note="$BASE is behind the agent host: git pull origin $BASE"
+    else
+      note="$BASE differs from the agent host's ($(git rev-parse --short "$host_base" 2>/dev/null || echo "${host_base:0:7}")) - pull it from origin first, then git agent sync"
+    fi
+    echo "connected to $HOST:src/$repo ($note)"
+    "$0" list
     ;;
   sync)
     # Plain push, never forced: if it's rejected, main on the agent host was moved
