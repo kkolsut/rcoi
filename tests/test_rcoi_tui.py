@@ -35,6 +35,8 @@ LIST = textwrap.dedent("""\
     /home/u/src/demo-tui                         620f572 [agent/tui]   session: coi-966d85eb-1 running
     /home/u/src/demo-red-giant                   643b721 [agent/red-giant]   profile: research   session: coi-b4-1 frozen, coi-b4-2 stopped
     /home/u/src/demo-new-ui                      643b721 [agent/new-ui]   profile: codex
+    /home/u/src/demo-check                       56205aa [agent/check]   session: coi-f9-1 running   agent: waiting   work: +1 commit, 3 uncommitted
+    /home/u/src/demo-gone                        56205aa [agent/gone]   profile: codex   session: coi-g-1 running   agent: no agent   work: +0 commits, clean
     """)
 
 
@@ -42,13 +44,19 @@ class ParseTest(unittest.TestCase):
     def test_task_list(self):
         tasks, repos = tui.parse_task_list(LIST)
         self.assertEqual(repos, ["demo"])
-        self.assertEqual(sorted(tasks), [("demo", "new-ui"), ("demo", "red-giant"), ("demo", "tui")])
+        self.assertEqual(sorted(tasks), [("demo", "check"), ("demo", "gone"), ("demo", "new-ui"),
+                                         ("demo", "red-giant"), ("demo", "tui")])
         t = tasks[("demo", "tui")]
         self.assertEqual((t.worktree, t.profile, t.session), ("/home/u/src/demo-tui", "", ("coi-966d85eb-1", "running")))
         r = tasks[("demo", "red-giant")]
         self.assertEqual((r.profile, r.state), ("research", "frozen"))
         self.assertEqual(len(r.sessions), 2)
         self.assertEqual(tasks[("demo", "new-ui")].state, "stopped")
+        self.assertEqual(t.state, "running")            # older coi-task: no agent field
+        c = tasks[("demo", "check")]
+        self.assertEqual((c.state, c.uncommitted, c.session), ("waiting", 3, ("coi-f9-1", "running")))
+        g = tasks[("demo", "gone")]
+        self.assertEqual((g.state, g.uncommitted, g.profile), ("no agent", 0, "codex"))
 
     def test_gone(self):
         tasks, _ = tui.parse_task_list(LIST)
@@ -156,7 +164,7 @@ class TuiTest(unittest.TestCase):
 
         with open(os.path.join(self.d, "list"), "w") as f:
             f.write("%s 1 [main]\n" % host)
-            f.write("%s-work 1 [agent/work]   session: coi-work-1 running\n" % host)
+            f.write("%s-work 1 [agent/work]   session: coi-work-1 running   agent: asking   work: +1 commit, 2 uncommitted\n" % host)
             f.write("%s-dead 1 [agent/dead]   session: coi-dead-1 running\n" % host)
             f.write("%s 1 [main]\n" % other)
             f.write("%s-feat 1 [agent/feat]   session: coi-feat-1 running\n" % other)
@@ -334,6 +342,22 @@ class TuiTest(unittest.TestCase):
         self.wait_for("feat")
         self.wait_for("solo")
         self.wait_for("one repo")               # the menu says what A does next
+
+    def test_agent_state_and_wip(self):
+        self.start()
+        self.ready()
+        self.wait_for("asking")
+        self.key("j")                           # work: asking -> the menu offers to answer
+        self.wait_for("answer")
+
+    def test_old_coi_task_on_host_is_flagged(self):
+        with open(os.path.join(self.d, "list")) as f:
+            old = f.read()
+        with open(os.path.join(self.d, "list"), "w") as f:      # no agent:/work: fields
+            f.write(old.replace("   agent: asking   work: +1 commit, 2 uncommitted", ""))
+        self.start()
+        self.ready()
+        self.wait_for("too old to show what agents are doing")
 
     def test_status_clears_and_keys_stay(self):
         self.start()

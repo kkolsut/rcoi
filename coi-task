@@ -19,8 +19,10 @@
 #   coi-task attach <repo> <task>          attach to the background session (detach: Ctrl+B, then d)
 #   coi-task peek   <repo> <task> [lines]  print the session's screen (default 40 lines)
 #   coi-task send   <repo> <task> "text"   type text + Enter into the session
-#   coi-task wait   <repo> <task> [secs]   wait until the agent is idle (its input box is back);
-#                                          gives up after secs (default: never)
+#   coi-task wait   <repo> <task> [secs]   wait until the agent is idle (its input box is back)
+#                                          or asks you something; gives up after secs (default: never)
+#   coi-task status <repo> <task>          what the agent is doing, and its work, e.g.
+#                                          "waiting  +4 commits, 3 uncommitted" (see list)
 #   coi-task wip    <repo> <task> [--color]
 #                                          the task worktree's uncommitted changes (status + diff)
 #   coi-task commit <repo> <task> ["msg"]  commit everything in the task worktree (git add -A),
@@ -28,7 +30,9 @@
 #   coi-task stop   <repo> <task>          shut the task's session down (the worktree stays)
 #   coi-task done   <repo> <task>          stop + remove the worktree + delete agent/<task> (merged only)
 #   coi-task drop   <repo> <task> [-y]     the same for unmerged work: discards it (asks first)
-#   coi-task list   [<repo>]               task worktrees and their sessions
+#   coi-task list   [<repo>]               task worktrees, their sessions, what each agent is doing
+#                                          (agent: working | waiting | asking | no agent | starting)
+#                                          and its work (commits not in main, uncommitted files)
 #   coi-task remove <repo> [-y]            drop every task, then delete ~/src/<repo> (run by `git agent remove`)
 #
 # Code arrives from the laptop over SSH (`git agent init` / `git agent sync`
@@ -393,24 +397,83 @@ cmd_send() {
 # Claude and Codex show while they work, three checks in a row (an agent can
 # pause briefly between steps). Right after a send the agent may not have
 # started yet; that's what the repeated checks are for, too.
+# What the agent in a container is doing, read from its screen (like `wait`):
+#   working   it shows "esc to interrupt" (Claude and Codex, while busy)
+#   asking    a question or approval on screen (permission, trust, login, a choice)
+#   waiting   its input box is back: the turn ended - done, or it wants a reply
+#   no agent  the container runs but the agent's tmux session is gone
+#   starting  none of these yet (booting, or a screen it doesn't know)
+# Best effort: it matches the agents' own screen text. Only the bottom of the
+# screen counts, so text in the conversation can't fool it.
+agent_state() {   # agent_state <container>
+  local screen
+  # tmux directly (not `coi tmux capture`: half the time). -T: no pty.
+  if ! screen=$(incus exec -T "$1" --user 1000 -- tmux capture-pane -p -t "=coi-$1:" </dev/null 2>&1); then
+    if grep -qiE "can't find session|no server running|error connecting" <<<"$screen"; then
+      echo "no agent"
+    else
+      echo "unknown"
+    fi
+    return 0
+  fi
+  screen=$(sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' <<<"$screen" | tail -n 15)
+  if grep -qi 'esc to interrupt' <<<"$screen"; then
+    echo working
+  elif grep -qiE 'trust this folder|Sign in with|Do you want to |Would you like to |Allow command|Enter to (select|confirm)|Esc to cancel' <<<"$screen"; then
+    echo asking
+  elif grep -qE 'bypass permissions|for shortcuts|context left' <<<"$screen"; then
+    echo waiting
+  else
+    echo starting
+  fi
+}
+
+# "+4 commits, 3 uncommitted" / "+4 commits, clean" for a task worktree:
+# commits on agent/<task> not in the repo's checked-out branch (main).
+work_summary() {   # work_summary <repo dir> <task> <worktree>
+  local n d
+  n=$(git -C "$1" rev-list --count "HEAD..refs/heads/agent/$2" 2>/dev/null || echo "?")
+  d=$(git -C "$3" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  printf '+%s commit%s, %s' "$n" "$([[ $n == 1 ]] || echo s)" "$([[ $d == 0 ]] && echo clean || echo "$d uncommitted")"
+}
+
+cmd_status() {
+  [[ $# -eq 2 ]] || usage 1
+  local repo; repo=$(repo_dir "$1"); valid "$2"
+  local wt="$SRC/$1-$2" ct state
+  [[ -d $wt ]] || die "no task $1 $2 (no worktree $wt)"
+  ct=$(containers "$wt" | head -1)
+  if [[ -z $ct ]]; then
+    state="stopped"
+  elif sessions | awk -F'\t' -v c="$ct" '$1 == c && $2 == "frozen" { f = 1 } END { exit !f }'; then
+    state="frozen"
+  else
+    state=$(agent_state "$ct")
+  fi
+  printf '%-9s %s\n' "$state" "$(work_summary "$repo" "$2" "$wt")"
+}
+
 cmd_wait() {
   [[ $# -eq 2 || $# -eq 3 ]] || usage 1
   local timeout=${3:-0}
   [[ $timeout =~ ^[0-9]+$ ]] || usage 1
   TASK_REPO=$1 TASK_NAME=$2
-  local wt ct screen idle=0 start=$SECONDS
+  local wt ct idle=0 start=$SECONDS
   wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
   while :; do
     containers "$wt" | grep -qxF -- "$ct" || die "session $ct ended"
-    screen=$(coi tmux capture "$ct" 2>/dev/null || true)
-    if grep -qi 'esc to interrupt' <<<"$screen"; then
-      idle=0
-    elif grep -qE 'bypass permissions|for shortcuts|context left' <<<"$screen"; then
-      idle=$((idle + 1))
-      if ((idle >= 3)); then say "$ct is idle"; return 0; fi
-    else
-      idle=0
-    fi
+    case $(agent_state "$ct") in
+      waiting)
+        idle=$((idle + 1))
+        if ((idle >= 3)); then say "$ct is idle"; return 0; fi
+        ;;
+      asking)
+        idle=$((idle + 1))
+        if ((idle >= 3)); then say "$ct is asking you something (look: coi-task peek $1 $2)"; return 0; fi
+        ;;
+      "no agent") die "$ct runs, but its agent is gone (restart: coi-task stop $1 $2, then shell --bg)" ;;
+      *) idle=0 ;;
+    esac
     if ((timeout && SECONDS - start >= timeout)); then
       die "$ct still busy after ${timeout}s (look: coi-task peek $1 $2)"
     fi
@@ -550,19 +613,30 @@ cmd_remove() {
 }
 
 cmd_list() {
-  local r all
+  local r all ct st states
   all=$(sessions 2>/dev/null || true)
+  # What each running agent is doing: one screen capture per session, all at once.
+  states=$(mktemp -d "${TMPDIR:-/tmp}/coi-task-list.XXXXXX")
+  trap 'rm -rf "$states"' RETURN
+  while IFS=$'\t' read -r ct st _; do
+    [[ $st == running ]] && agent_state "$ct" >"$states/$ct" &
+  done <<<"$all"
+  wait
   list_repo() {
-    local line wt rest ses prof task
+    local line wt rest ses prof task agent work
     while read -r line; do
       wt=${line%% *}; rest=${line#"$wt"}
       ses=$(awk -F'\t' -v w="$wt" '$3 == w { printf "%s%s %s", (n++ ? ", " : ""), $1, $2 }' <<<"$all")
-      prof=""
+      prof="" agent="" work=""
       if [[ $wt == "$1"-* ]]; then
         task=${wt#"$1"-}
         prof=$(git -C "$1" config --get "coi-task.$task.profile" || true)
+        work=$(work_summary "$1" "$task" "$wt")
+        ct=$(awk -F'\t' -v w="$wt" '$3 == w && $2 == "running" { print $1; exit }' <<<"$all")
+        [[ -n $ct && -s $states/$ct ]] && agent=$(<"$states/$ct")
       fi
-      printf '%-44s %s%s%s\n' "$wt" "${rest# }" "${prof:+   profile: $prof}" "${ses:+   session: $ses}"
+      printf '%-44s %s%s%s%s%s\n' "$wt" "${rest# }" "${prof:+   profile: $prof}" "${ses:+   session: $ses}" \
+        "${agent:+   agent: $agent}" "${work:+   work: $work}"
     done < <(git -C "$1" worktree list)
   }
   if [[ $# -eq 1 ]]; then list_repo "$(repo_dir "$1")"; return; fi
@@ -573,7 +647,7 @@ cmd_list() {
 }
 
 case "${1:-}" in
-  init|new|shell|attach|peek|send|wait|wip|commit|stop|done|drop|list|remove) c=$1; shift; "cmd_$c" "$@" ;;
+  init|new|shell|attach|peek|send|wait|status|wip|commit|stop|done|drop|list|remove) c=$1; shift; "cmd_$c" "$@" ;;
   -h|--help|help|"") usage 0 ;;
   *) usage 1 ;;
 esac
