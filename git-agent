@@ -30,13 +30,19 @@ usage: git agent <command> [task]
   remove [-y]   delete ~/src/<repo> and its tasks on the agent host, then the '$REMOTE' remote
                 (asks first; unmerged agent branches there are lost)
   sync          push $BASE to the agent host (agents start new tasks from it)
-  list          fetch and list the agent branches (newest first)
+  list          fetch and list the agent branches (newest first), flagging those with
+                nothing new vs $BASE or uncommitted changes in the host's worktree
   diff <task>   what the agent changed since it branched off $BASE
   log  <task>   the same, commit by commit
-  try  <task>   check it out as review/<task> (this runs the agent's code: read the diff first)
+  try  <task>   check it out as review/<task> (this runs the agent's code: read the diff first);
+                again later: switch to it and fast-forward it to the agent's new commits
+  pull [task]   bring the agent's new commits into review/<task> (creates it if missing)
+  push [task]   send your commits on review/<task> to agent/<task> on the agent host,
+                so the agent continues from them (never forced: pull first if it moved)
   merge <task>  merge it into $BASE (then: git push origin $BASE && git agent sync)
 
-  <task> is the name given to 'rcoi task new <repo> <task>'.
+  <task> is the name given to 'rcoi task new <repo> <task>'; pull and push
+  default to the task of the current review/<task> branch.
   Host: ${HOST:-<not set>} (AGENTVM_HOST, RCOI_HOST or $conf).
   Env: AGENTVM_REMOTE ($REMOTE), AGENTVM_BASE ($BASE).
 EOF
@@ -60,6 +66,56 @@ branch() {
   local ref="refs/remotes/$REMOTE/agent/$1"
   git rev-parse -q --verify "$ref" >/dev/null || die "no branch agent/$1 on the agent host (see: git agent list)"
   echo "$REMOTE/agent/$1"
+}
+
+# The task for pull/push: the argument, else the current review/<task> branch.
+task_arg() {
+  if [ -n "${1:-}" ]; then echo "$1"; return; fi
+  local cur; cur=$(git symbolic-ref -q --short HEAD || true)
+  [[ $cur == review/?* ]] || die "missing task name (or run it on a review/<task> branch)"
+  echo "${cur#review/}"
+}
+
+# Of the given tasks, those whose worktree on the agent host (<repo path>-<task>,
+# next to the repo, as coi-task makes them) has uncommitted changes, one per
+# line. Best effort: prints nothing if the host can't be asked.
+dirty_tasks() {
+  local url host path t q=() cmd
+  url=$(git remote get-url "$REMOTE" 2>/dev/null) || return 0
+  [[ $url == ?*:?* && $url != *://* ]] || return 0    # only user@host:path remotes
+  host=${url%%:*} path=${url#*:}
+  for t in "$@"; do [[ $t =~ ^[A-Za-z0-9._-]+$ ]] && q+=("$t"); done
+  ((${#q[@]})) || return 0
+  # %q quotes every word for the remote shell (bash, as for rcoi).
+  printf -v cmd '%q ' "$path" "${q[@]}"
+  # shellcheck disable=SC2016  # $p, $t and $(...) are for the remote shell
+  ssh -n -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+    "set -- $cmd"'; p=$1; shift
+     for t; do [ -n "$(git -C "$p-$t" status --porcelain 2>/dev/null)" ] && echo "$t"; done; true' \
+    2>/dev/null || true
+}
+
+# What says a task isn't ready to review, comma separated (empty: nothing).
+# task_notes <task> <remote ref> <output of dirty_tasks>
+task_notes() {
+  local n=()
+  # No commits beyond main: the agent hasn't committed (or it's merged already).
+  if git merge-base --is-ancestor "$2" "refs/heads/$BASE" 2>/dev/null; then
+    n+=("nothing new vs $BASE")
+  fi
+  if grep -qxF -- "$1" <<<"$3"; then n+=("uncommitted changes on the host"); fi
+  local s="" x
+  for x in ${n[@]+"${n[@]}"}; do s+="${s:+, }$x"; done
+  echo "$s"
+}
+
+# Warn (stderr) before checking out a task that looks unfinished.
+warn_task() {   # warn_task <task> <remote ref>
+  local notes; notes=$(task_notes "$1" "$2" "$(dirty_tasks "$1")")
+  [[ -n $notes ]] || return 0
+  echo "git agent: warning: agent/$1: $notes" >&2
+  echo "git agent: the agent may not be done, or didn't commit - check: rcoi task peek $repo $1" >&2
+  echo "git agent: or ask it: rcoi task send $repo $1 'commit your work to the current branch'" >&2
 }
 
 cmd=${1:-help}
@@ -148,7 +204,14 @@ case $cmd in
     out=$(git for-each-ref --sort=-committerdate \
             --format='%(refname:lstrip=4)%09%(committerdate:relative)%09%(subject)' \
             "refs/remotes/$REMOTE/agent/")
-    if [ -z "$out" ]; then echo "no agent branches on the agent host"; else column -t -s $'\t' <<<"$out"; fi
+    if [ -z "$out" ]; then echo "no agent branches on the agent host"; exit 0; fi
+    # One ssh call for all tasks, then a 4th column with what's not ready.
+    # shellcheck disable=SC2046  # task names are [A-Za-z0-9._-], split on purpose
+    dirty=$(dirty_tasks $(cut -f1 <<<"$out"))
+    while IFS=$'\t' read -r t when subject; do
+      notes=$(task_notes "$t" "refs/remotes/$REMOTE/agent/$t" "$dirty")
+      printf '%s\t%s\t%s\t%s\n' "$t" "$when" "$subject" "${notes:+! $notes}"
+    done <<<"$out" | column -t -s $'\t'
     ;;
   diff)
     b=$(branch "${1:-}"); git diff "$BASE...$b"
@@ -157,7 +220,68 @@ case $cmd in
     b=$(branch "${1:-}"); git log -p "$BASE..$b"
     ;;
   try)
-    b=$(branch "${1:-}"); git switch -c "review/$1" "$b"
+    b=$(branch "${1:-}"); lb="review/$1"
+    warn_task "$1" "$b"
+    if ! git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      git switch -c "$lb" "$b"
+      exit 0
+    fi
+    # Tried before: switch to it and bring in the agent's new commits, but
+    # only by fast-forward - your own commits there are for 'git agent pull'.
+    git switch -q "$lb"
+    if git merge-base --is-ancestor "$b" HEAD; then
+      echo "on $lb, up to date with $b"
+    elif git merge-base --is-ancestor HEAD "$b"; then
+      git merge -q --ff-only "$b"
+      echo "on $lb, fast-forwarded to $b"
+    else
+      die "on $lb, which has commits of its own; bring in the agent's new ones with: git agent pull $1"
+    fi
+    ;;
+  pull)
+    # Bring the agent's work (or what you pushed from another machine) into
+    # review/<task>. Merges, never rebases: the agent's history stays as it is.
+    [[ $# -le 1 ]] || die "usage: git agent pull [task]"
+    task=$(task_arg "${1:-}")
+    b=$(branch "$task")
+    lb="review/$task"
+    cur=$(git symbolic-ref -q --short HEAD || true)
+    if ! git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      git branch -q "$lb" "$b"
+      echo "created $lb from $b (git switch $lb)"
+    elif git merge-base --is-ancestor "$b" "refs/heads/$lb"; then
+      echo "$lb already has everything from $b"
+    elif [[ $cur == "$lb" ]]; then
+      git merge -m "Merge $b into $lb" "$b"
+    elif git merge-base --is-ancestor "refs/heads/$lb" "$b"; then
+      git branch -q -f "$lb" "$b"
+      echo "fast-forwarded $lb to $b"
+    else
+      die "$lb and $b have both moved on; merge them on the branch: git switch $lb && git agent pull"
+    fi
+    ;;
+  push)
+    # Your commits on review/<task> become the agent's branch. The host updates
+    # the task worktree's files too, and refuses if the agent has uncommitted
+    # changes there. Never forced: if the agent committed meanwhile, pull first.
+    [[ $# -le 1 ]] || die "usage: git agent push [task]"
+    task=$(task_arg "${1:-}")
+    lb="review/$task"
+    git rev-parse -q --verify "refs/heads/$lb" >/dev/null || die "no local branch $lb (create it: git agent pull $task)"
+    b=$(branch "$task")    # only existing tasks: a new branch there would have no worktree
+    if git merge-base --is-ancestor "refs/heads/$lb" "$b"; then
+      echo "nothing to push: $b already has everything from $lb"; exit 0
+    fi
+    if ! git merge-base --is-ancestor "$b" "refs/heads/$lb"; then
+      die "the agent committed to agent/$task since you last pulled: git agent pull $task, then push again"
+    fi
+    if [[ $(git symbolic-ref -q --short HEAD || true) == "$lb" && -n $(git status --porcelain --untracked-files=no) ]]; then
+      echo "note: uncommitted changes in $lb are not pushed" >&2
+    fi
+    git push "$REMOTE" "refs/heads/$lb:refs/heads/agent/$task" \
+      || die "push refused (above). 'Working directory has ... changes': the agent has uncommitted work in its worktree - let it commit (or stop it), then push again"
+    echo "pushed $lb to agent/$task; a running agent doesn't know yet - tell it, e.g.:"
+    echo "  rcoi task send $repo $task 'I pushed new commits to your branch (git log); continue from them'"
     ;;
   merge)
     b=$(branch "${1:-}")
