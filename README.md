@@ -179,6 +179,10 @@ rcoi task list                 # tasks, whether their session is running, their 
 rcoi task peek myrepo sum      # the agent's screen (add a number for more lines: peek myrepo sum 100)
 git agent list                 # agent branches and their latest commit
 ```
+`list` (and `try`) flag a task with `nothing new vs main` (the agent hasn't
+committed yet, or it's merged already) or `uncommitted changes on the host`
+(its worktree has edits that aren't in any commit, so `diff`/`try` can't see
+them yet). Either way: let it finish, or `rcoi task send myrepo sum 'commit your work'`.
 
 **4. Follow up or take over**
 ```bash
@@ -191,6 +195,8 @@ rcoi task attach myrepo sum    # interactive; detach with Ctrl+B, release, then 
 git agent diff sum             # or: git agent log sum
 git agent try sum              # check it out as review/sum, to run or test it
                                # (this runs the agent's code: read the diff first)
+git agent try sum              # again later: back on review/sum, fast-forwarded to
+                               # the agent's new commits (pull if you committed there too)
 ```
 
 **5b. Work on it together** (both ways, as often as you like)
@@ -452,7 +458,7 @@ git agent sync          push main to the agent host (never forced)
 git agent list          fetch and list the agent branches (newest first)
 git agent diff <task>   what the agent changed since it branched off main
 git agent log  <task>   the same, commit by commit
-git agent try  <task>   check it out as review/<task>
+git agent try  <task>   check it out as review/<task> (again: fast-forward it)
 git agent pull [task]   agent's new commits -> review/<task> (merge; creates it if missing)
 git agent push [task]   review/<task> -> agent/<task> on the host (never forced)
 git agent merge <task>  merge it into main
