@@ -34,9 +34,13 @@ usage: git agent <command> [task]
   diff <task>   what the agent changed since it branched off $BASE
   log  <task>   the same, commit by commit
   try  <task>   check it out as review/<task> (this runs the agent's code: read the diff first)
+  pull [task]   bring the agent's new commits into review/<task> (creates it if missing)
+  push [task]   send your commits on review/<task> to agent/<task> on the agent host,
+                so the agent continues from them (never forced: pull first if it moved)
   merge <task>  merge it into $BASE (then: git push origin $BASE && git agent sync)
 
-  <task> is the name given to 'rcoi task new <repo> <task>'.
+  <task> is the name given to 'rcoi task new <repo> <task>'; pull and push
+  default to the task of the current review/<task> branch.
   Host: ${HOST:-<not set>} (AGENTVM_HOST, RCOI_HOST or $conf).
   Env: AGENTVM_REMOTE ($REMOTE), AGENTVM_BASE ($BASE).
 EOF
@@ -60,6 +64,14 @@ branch() {
   local ref="refs/remotes/$REMOTE/agent/$1"
   git rev-parse -q --verify "$ref" >/dev/null || die "no branch agent/$1 on the agent host (see: git agent list)"
   echo "$REMOTE/agent/$1"
+}
+
+# The task for pull/push: the argument, else the current review/<task> branch.
+task_arg() {
+  if [ -n "${1:-}" ]; then echo "$1"; return; fi
+  local cur; cur=$(git symbolic-ref -q --short HEAD || true)
+  [[ $cur == review/?* ]] || die "missing task name (or run it on a review/<task> branch)"
+  echo "${cur#review/}"
 }
 
 cmd=${1:-help}
@@ -158,6 +170,51 @@ case $cmd in
     ;;
   try)
     b=$(branch "${1:-}"); git switch -c "review/$1" "$b"
+    ;;
+  pull)
+    # Bring the agent's work (or what you pushed from another machine) into
+    # review/<task>. Merges, never rebases: the agent's history stays as it is.
+    [[ $# -le 1 ]] || die "usage: git agent pull [task]"
+    task=$(task_arg "${1:-}")
+    b=$(branch "$task")
+    lb="review/$task"
+    cur=$(git symbolic-ref -q --short HEAD || true)
+    if ! git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      git branch -q "$lb" "$b"
+      echo "created $lb from $b (git switch $lb)"
+    elif git merge-base --is-ancestor "$b" "refs/heads/$lb"; then
+      echo "$lb already has everything from $b"
+    elif [[ $cur == "$lb" ]]; then
+      git merge -m "Merge $b into $lb" "$b"
+    elif git merge-base --is-ancestor "refs/heads/$lb" "$b"; then
+      git branch -q -f "$lb" "$b"
+      echo "fast-forwarded $lb to $b"
+    else
+      die "$lb and $b have both moved on; merge them on the branch: git switch $lb && git agent pull"
+    fi
+    ;;
+  push)
+    # Your commits on review/<task> become the agent's branch. The host updates
+    # the task worktree's files too, and refuses if the agent has uncommitted
+    # changes there. Never forced: if the agent committed meanwhile, pull first.
+    [[ $# -le 1 ]] || die "usage: git agent push [task]"
+    task=$(task_arg "${1:-}")
+    lb="review/$task"
+    git rev-parse -q --verify "refs/heads/$lb" >/dev/null || die "no local branch $lb (create it: git agent pull $task)"
+    b=$(branch "$task")    # only existing tasks: a new branch there would have no worktree
+    if git merge-base --is-ancestor "refs/heads/$lb" "$b"; then
+      echo "nothing to push: $b already has everything from $lb"; exit 0
+    fi
+    if ! git merge-base --is-ancestor "$b" "refs/heads/$lb"; then
+      die "the agent committed to agent/$task since you last pulled: git agent pull $task, then push again"
+    fi
+    if [[ $(git symbolic-ref -q --short HEAD || true) == "$lb" && -n $(git status --porcelain --untracked-files=no) ]]; then
+      echo "note: uncommitted changes in $lb are not pushed" >&2
+    fi
+    git push "$REMOTE" "refs/heads/$lb:refs/heads/agent/$task" \
+      || die "push refused (above). 'Working directory has ... changes': the agent has uncommitted work in its worktree - let it commit (or stop it), then push again"
+    echo "pushed $lb to agent/$task; a running agent doesn't know yet - tell it, e.g.:"
+    echo "  rcoi task send $repo $task 'I pushed new commits to your branch (git log); continue from them'"
     ;;
   merge)
     b=$(branch "${1:-}")
