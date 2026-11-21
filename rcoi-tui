@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""rcoi-tui - a terminal UI for rcoi tasks and git agent branches.
+
+usage: rcoi-tui [-a|--all] [--interval SECONDS] [--no-mux]
+
+Run it inside a repo on your machine: it shows that repo's tasks on the agent
+host (rcoi task list) next to their agent/<task> branches (git agent), with a
+live view of the selected agent's screen. R picks another repo, A switches
+between one repo and all of them; outside a repo, or with --all, it starts
+with all of them.
+
+It is a front end only: every action runs rcoi or git agent, and the command
+it runs is shown in the output log (o). git agent runs in the repo's local
+clone (new syncs main first; done and drop also remove review/<task> there).
+Clones are found by their agentvm remote, one or two levels below the folders
+in RCOI_TUI_ROOTS (colon-separated; default: ~/Projects, ~/src, ~/code and the
+folder holding the current repo). For a repo without a clone the git actions
+are off, and new/done/drop use rcoi task.
+
+  --all          start with the tasks of every repo
+  --interval N   refresh the selected agent's screen every N seconds (default 2)
+  --no-mux       don't share one SSH connection between commands
+
+Keys (? inside the UI shows them too):
+  j/k, arrows    select                    Tab        preview: screen / changes
+  R              pick a repo               A          one repo / all repos
+  Enter, a       attach (Ctrl+B, d)        n          new task (--bg, optional prompt)
+  s              send text to the agent    u          start a session (restarts a dead one)
+  x              stop the session          w          the agent's uncommitted changes
+  c              commit them on the host   d / l      diff / log in your pager
+  t              try (review/<task>)       p / P      pull / push review/<task>
+  U              update review/<task> with main, then push it
+  m              merge into main           D          done (merged only)
+  X              drop (discards the work)  y          sync main to the host
+  r              refresh now               o          output of past commands
+  q              quit
+
+SESSION "no agent" means the container runs but the agent's tmux session is
+gone (the agent exited, or killed its tmux server): u restarts it.
+"""
+import curses
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "rcoi", "host")
+REMOTE = os.environ.get("AGENTVM_REMOTE", "agentvm")
+BASE = os.environ.get("AGENTVM_BASE", "main")
+LIST_INTERVAL = 15          # seconds between full refreshes
+STATUS_SECS = float(os.environ.get("RCOI_TUI_STATUS_SECS", 8))   # how long "done" messages stay (errors stay until a key is pressed)
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def tool(name, fallback):
+    """The script installed next to this one (same version), else from PATH."""
+    p = os.path.join(HERE, name)
+    return [p] if os.access(p, os.X_OK) else fallback
+
+
+RCOI = tool("rcoi", ["rcoi"])
+GIT_AGENT = tool("git-agent", ["git", "agent"])
+
+
+def valid_name(s):
+    return bool(NAME_RE.match(s)) and not s.startswith(".")
+
+
+def run(cmd, cwd=None, timeout=None):
+    """Run cmd without a terminal; returns (exit code, stdout+stderr)."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, timeout=timeout)
+    except FileNotFoundError as e:
+        return 127, str(e)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out: " + " ".join(cmd)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+def git(*args, cwd=None):
+    return run(["git"] + list(args), cwd=cwd)
+
+
+def git_out(*args, cwd=None):
+    rc, out = git(*args, cwd=cwd)
+    return out.strip() if rc == 0 else ""
+
+
+def host_repo(path):
+    """The repo's name on the agent host (its agentvm remote is host:src/<name>), or ""."""
+    url = git_out("remote", "get-url", REMOTE, cwd=path)
+    name = os.path.basename(url.split(":", 1)[-1].rstrip("/")) if url else ""
+    return name[:-4] if name.endswith(".git") else name
+
+
+def roots(here_top):
+    """Folders to look for local clones in: RCOI_TUI_ROOTS (colon-separated),
+    else ~/Projects, ~/src, ~/code and the folder the current repo is in."""
+    env = os.environ.get("RCOI_TUI_ROOTS")
+    if env is not None:
+        dirs = [os.path.expanduser(d) for d in env.split(":") if d]
+    else:
+        dirs = [os.path.expanduser(d) for d in ("~/Projects", "~/src", "~/code")]
+        if here_top:
+            dirs.insert(0, os.path.dirname(here_top))
+    seen, out = set(), []
+    for d in dirs:
+        d = os.path.realpath(d)
+        if d not in seen and os.path.isdir(d):
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def find_clones(dirs, here_top=None):
+    """{host repo name: local path} for the repos with an agentvm remote,
+    one or two levels below each of dirs. The current repo wins a tie."""
+    found = {}
+    cands = [here_top] if here_top else []
+    for d in dirs:
+        for sub in sorted(os.listdir(d)):
+            p = os.path.join(d, sub)
+            if not os.path.isdir(p) or sub.startswith("."):
+                continue
+            if os.path.exists(os.path.join(p, ".git")):
+                cands.append(p)
+                continue
+            try:
+                cands += [os.path.join(p, s) for s in sorted(os.listdir(p))
+                          if os.path.exists(os.path.join(p, s, ".git"))]
+            except OSError:
+                pass
+    for p in cands:
+        name = host_repo(p)
+        if name and name not in found:
+            found[name] = p
+    return found
+
+
+def compare_base(path, local):
+    """Local main vs the host's main: (same|ahead|behind|diverged|unknown, note)."""
+    rc, out = git("ls-remote", "-q", REMOTE, "refs/heads/" + BASE, cwd=path)
+    host = out.split()[0] if rc == 0 and out.strip() else ""
+    if not host:
+        return "unknown", "no %s on the agent host" % BASE
+    if not local:
+        return "unknown", "no local %s" % BASE
+    if host == local:
+        return "same", "%s in sync" % BASE
+    known = git("cat-file", "-e", host + "^{commit}", cwd=path)[0] == 0
+    if known and git("merge-base", "--is-ancestor", host, local, cwd=path)[0] == 0:
+        n = git_out("rev-list", "--count", "%s..%s" % (host, local), cwd=path)
+        return "ahead", "%s: %s commit(s) not on the host (y: sync)" % (BASE, n)
+    if known and git("merge-base", "--is-ancestor", local, host, cwd=path)[0] == 0:
+        return "behind", "%s is behind the host's" % BASE
+    return "diverged", "%s differs from the host's" % BASE
+
+
+# What `coi tmux capture` says when the container runs but its tmux session doesn't.
+NO_TMUX_RE = re.compile(r"can't find session|no tmux session|no server running|error connecting to", re.I)
+CTRL_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean(line):
+    return CTRL_RE.sub("", line.replace("\t", "    ").rstrip("\r\n"))
+
+
+def shown(cmd):
+    """A command as the user would type it (for the output log)."""
+    import shlex
+    words = list(cmd)
+    if words[:1] == RCOI:
+        words[0] = "rcoi"
+    elif words[:1] == GIT_AGENT[:1] and GIT_AGENT != ["git", "agent"]:
+        words[:1] = ["git", "agent"]
+    return " ".join(shlex.quote(w) for w in words)
+
+
+class Task:
+    def __init__(self, repo, name):
+        self.repo = repo
+        self.name = name
+        self.worktree = ""      # path on the agent host, "" if none
+        self.profile = ""
+        self.sessions = []      # [(container, status)]
+        self.ref = ""           # refs/remotes/agentvm/agent/<name> here, if fetched
+        self.updated = ""       # committer date, relative
+        self.subject = ""
+        self.ahead = None       # commits not in local main
+        self.behind = None
+        self.review = False     # review/<name> exists in the clone
+        self.clone = ""         # local clone of the repo ("" if none found)
+        self.gone = False       # container up, agent's tmux session gone
+
+    @property
+    def key(self):
+        return (self.repo, self.name)
+
+    @property
+    def session(self):
+        """The live container (running or frozen), else None."""
+        for ct, st in self.sessions:
+            if st in ("running", "frozen"):
+                return ct, st
+        return None
+
+    @property
+    def state(self):
+        s = self.session
+        if s:
+            return "no agent" if self.gone else s[1]
+        if self.worktree:
+            return "stopped"
+        return "no worktree"
+
+
+def parse_task_list(text):
+    """Parse `coi-task list` output into ({key: Task}, [repos])."""
+    tasks, repos = {}, []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.startswith("/"):
+            continue
+        path = line.split()[0]
+        m = re.search(r"\[([^\]]+)\]", line)
+        branch = m.group(1) if m else ""
+        base = os.path.basename(path)
+        if not branch.startswith("agent/"):
+            repos.append(base)          # the repo itself (its first worktree)
+            continue
+        name = branch[len("agent/"):]
+        repo = base[: -len(name) - 1] if base.endswith("-" + name) else base
+        t = Task(repo, name)
+        t.worktree = path
+        m = re.search(r"profile: (\S+)", line)
+        t.profile = m.group(1) if m else ""
+        m = re.search(r"session: (.*)$", line)
+        if m:
+            for part in m.group(1).split(", "):
+                bits = part.split()
+                if len(bits) >= 2:
+                    t.sessions.append((bits[0], bits[1]))
+        tasks[t.key] = t
+    return tasks, repos
+
+
+class Model:
+    """State shared between the UI thread and the background fetchers."""
+
+    def __init__(self, host, here, clones, all_repos):
+        self.lock = threading.Lock()
+        self.host = host
+        self.here = here                # the host repo name of the folder we started in, or None
+        self.clones = clones            # host repo name -> local clone (with the agentvm remote)
+        self.view = None if (all_repos or not here) else here   # repo shown, None: all
+        self.tasks = []                 # every repo's tasks; visible() filters by view
+        self.repos = []                 # repos on the host, and ones with a local clone
+        self.bases = {}                 # repo -> (state, note): local main vs the host's
+        self.list_error = ""
+        self.refreshing = False
+        self.refreshed_at = 0.0
+        self.screens = {}               # key -> (time, [lines])
+        self.dead = {}                  # key -> container whose agent's tmux session is gone
+        self.changes = {}               # (key, sha) -> [lines]
+        self.action = None              # label of the running action
+        self.status = ""
+        self.status_ok = True
+        self.log = []                   # output of every action
+        self.wake_list = threading.Event()
+        self.wake_peek = threading.Event()
+        self.selected = None            # key of the selected task (set by the UI)
+        self.preview_lines = 20
+        self.preview = "screen"         # or "changes"
+
+    def visible(self):
+        return [t for t in self.tasks if self.view is None or t.repo == self.view]
+
+    # ---------------------------------------------------------------- refresh
+    def refresh(self):
+        with self.lock:
+            self.refreshing = True
+        # Always every repo: switching the view (A, R) is then instant.
+        rc, out = run(RCOI + ["task", "list"], timeout=60)
+        tasks, repos = parse_task_list(out) if rc == 0 else ({}, [])
+        err = "" if rc == 0 else (clean(out.strip().splitlines()[-1]) if out.strip() else "rcoi task list failed")
+
+        bases = {}
+        for repo, path in sorted(self.clones.items()):
+            git("fetch", "-q", "--prune", REMOTE, cwd=path)
+            fmt = "%(refname:lstrip=4)%09%(committerdate:relative)%09%(subject)"
+            refs = git_out("for-each-ref", "--sort=-committerdate", "--format=" + fmt,
+                           "refs/remotes/%s/agent/" % REMOTE, cwd=path)
+            local_base = git_out("rev-parse", "-q", "--verify", "refs/heads/" + BASE, cwd=path)
+            for line in refs.splitlines():
+                name, updated, subject = (line.split("\t", 2) + ["", ""])[:3]
+                t = tasks.get((repo, name))
+                if t is None:
+                    t = tasks[(repo, name)] = Task(repo, name)
+                t.ref = "refs/remotes/%s/agent/%s" % (REMOTE, name)
+                t.updated, t.subject = updated, subject
+                if local_base:
+                    counts = git_out("rev-list", "--left-right", "--count",
+                                     "%s...%s" % (local_base, t.ref), cwd=path).split()
+                    if len(counts) == 2:
+                        t.behind, t.ahead = int(counts[0]), int(counts[1])
+            bases[repo] = compare_base(path, local_base)
+            for name in git_out("for-each-ref", "--format=%(refname:lstrip=3)", "refs/heads/review/", cwd=path).split():
+                t = tasks.get((repo, name))
+                if t is not None:
+                    t.review = True
+        for t in tasks.values():
+            t.clone = self.clones.get(t.repo, "")
+
+        order = sorted(tasks.values(), key=lambda t: (t.repo != self.here, t.repo, t.session is None, t.name))
+        with self.lock:
+            for t in order:
+                t.gone = bool(t.session) and self.dead.get(t.key) == t.session[0]
+            self.tasks = order
+            self.repos = sorted(set(repos) | set(self.clones))
+            self.list_error = err
+            self.bases = bases
+            self.refreshing = False
+            self.refreshed_at = time.time()
+
+    def changes_for(self, t):
+        sha = git_out("rev-parse", "-q", "--verify", t.ref, cwd=t.clone) if t.ref and t.clone else ""
+        key = (t.key, sha)
+        if key in self.changes:
+            return self.changes[key]
+        if not t.clone:
+            lines = ["(no local clone of %s found - see RCOI_TUI_ROOTS in ?)" % t.repo]
+        elif not sha:
+            lines = ["(no agent/%s branch fetched in %s)" % (t.name, t.clone)]
+        else:
+            log = git_out("log", "--format=%h %s (%cr)", "%s..%s" % (BASE, sha), cwd=t.clone)
+            stat = git_out("diff", "--stat", "%s...%s" % (BASE, sha), cwd=t.clone)
+            lines = ["commits not in %s:" % BASE] + (log.splitlines() or ["  (none)"])
+            lines += [""] + (stat.splitlines() or ["(no changes)"])
+        self.changes[key] = lines
+        return lines
+
+    # -------------------------------------------------------------- loops
+    def list_loop(self):
+        while True:
+            try:
+                self.refresh()
+            except Exception as e:      # keep the UI alive; show what broke
+                with self.lock:
+                    self.refreshing = False
+                    self.list_error = "refresh failed: %s" % e
+            self.wake_list.wait(LIST_INTERVAL)
+            self.wake_list.clear()
+
+    def peek_loop(self, interval):
+        while True:
+            with self.lock:
+                key, n, mode = self.selected, self.preview_lines, self.preview
+                t = next((x for x in self.tasks if x.key == key), None)
+            if t is not None and mode == "screen" and t.session:
+                ct = t.session[0]
+                rc, out = run(RCOI + ["task", "peek", t.repo, t.name, str(max(n, 5))], timeout=30)
+                lines = [clean(l) for l in out.splitlines()]
+                gone = bool(NO_TMUX_RE.search(out))
+                if gone:
+                    lines = ["(the container %s is running, but the agent's tmux session is gone:" % ct,
+                             " it exited, or something in it killed the tmux server)", "",
+                             "u: restart it (stop + start; the worktree and commits stay)"]
+                elif rc != 0:
+                    lines = ["(peek failed)"] + lines[-3:]
+                with self.lock:
+                    self.screens[key] = (time.time(), lines)
+                    if gone:
+                        self.dead[key] = ct
+                    elif self.dead.get(key) == ct:
+                        del self.dead[key]
+                    t.gone = gone
+            self.wake_peek.wait(interval)
+            self.wake_peek.clear()
+
+    # -------------------------------------------------------------- actions
+    def start_action(self, label, cmds, cwd=None):
+        """Run cmds one after another in the background (stop at the first failure),
+        in cwd (a repo's clone, for git agent)."""
+        with self.lock:
+            if self.action:
+                self.status, self.status_ok = "busy: %s" % self.action, False
+                return
+            self.action = label
+            self.status, self.status_ok = label + " ...", True
+        threading.Thread(target=self._action, args=(label, cmds, cwd), daemon=True).start()
+
+    def _action(self, label, cmds, cwd):
+        ok, last = True, ""
+        for cmd in cmds:
+            rc, out = run(cmd, cwd=cwd)
+            lines = [clean(l) for l in out.splitlines()]
+            with self.lock:
+                self.log.append(("(%s) " % cwd if cwd else "") + "$ " + shown(cmd)
+                                + ("" if rc == 0 else "   [exit %d]" % rc))
+                self.log.extend("  " + l for l in lines)
+            last = next((l for l in reversed(lines) if l.strip()), "")
+            if rc != 0:
+                ok = False
+                break
+        with self.lock:
+            self.action = None
+            self.status_ok = ok
+            self.status = ("%s: done" % label if ok else "%s failed" % label) + (" - " + last if last else "") + "  (o: output)"
+            self.changes.clear()
+        self.wake_list.set()
+        self.wake_peek.set()
+
+
+# ======================================================================= UI
+HELP = [l[2:] if l.startswith("  ") else l for l in __doc__.splitlines()]
+
+
+class UI:
+    def __init__(self, scr, model, interval):
+        self.scr = scr
+        self.m = model
+        self.sel = 0
+        self.top = 0
+        self.interval = interval
+        self.shown_status, self.status_since = "", 0.0
+        curses.curs_set(0)
+        scr.keypad(True)
+        scr.timeout(250)
+        self.colors = {}
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            for i, (name, fg) in enumerate([("running", curses.COLOR_GREEN), ("frozen", curses.COLOR_CYAN),
+                                            ("warn", curses.COLOR_YELLOW), ("err", curses.COLOR_RED),
+                                            ("dim", curses.COLOR_BLUE)], 1):
+                curses.init_pair(i, fg, bg)
+                self.colors[name] = curses.color_pair(i)
+            # Key caps in the menu: dark on cyan (htop/nano style).
+            curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            self.colors["key"] = curses.color_pair(9) | curses.A_BOLD
+
+    def c(self, name):
+        return self.colors.get(name, 0)
+
+    # -------------------------------------------------------------- drawing
+    def put(self, y, x, text, attr=0, width=None):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        n = (w - x) if width is None else min(width, w - x)
+        if y == h - 1:
+            n -= 1          # writing the bottom-right cell raises an error
+        if n <= 0:
+            return
+        try:
+            self.scr.addnstr(y, x, text, n, attr)
+        except curses.error:
+            pass
+
+    def current(self):
+        tasks = self.m.visible()
+        if not tasks:
+            return None
+        self.sel = max(0, min(self.sel, len(tasks) - 1))
+        return tasks[self.sel]
+
+    def draw(self, prompt=None):
+        m, scr = self.m, self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        with m.lock:
+            tasks = m.visible()
+            cur = self.current()
+            m.selected = cur.key if cur else None
+            # header
+            where = "all repos" if m.view is None else "repo: %s" % m.view
+            spin = "   refreshing..." if m.refreshing else ""
+            head = " rcoi-tui   %s   host: %s%s" % (where, m.host or "<not set>", spin)
+            self.put(0, 0, head.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            # main vs the host's, for the repo in view (or the selected task's)
+            repo = m.view or (cur.repo if cur else None)
+            note, attr = "", 0
+            if repo:
+                if repo in m.clones:
+                    state, note = m.bases.get(repo, ("", ""))
+                    note = ("%s: " % repo if m.view is None else "") + note if note else ""
+                    if state in ("ahead", "behind", "diverged", "unknown"):
+                        attr = self.c("warn")
+                elif m.refreshed_at:
+                    note, attr = ("%s: no local clone found (git actions off; RCOI_TUI_ROOTS, see ?)" % repo,
+                                  self.c("warn"))
+            if m.list_error:
+                note, attr = m.list_error, self.c("err")
+            self.put(1, 1, note, attr)
+
+            # task table
+            show_repo = m.view is None
+            cols = [("TASK", 18), ("SESSION", 9), ("PROFILE", 10), ("+/-", 7), ("REVIEW", 6), ("UPDATED", 16)]
+            if show_repo:
+                cols.insert(0, ("REPO", 14))
+            table_h = max(3, min(len(tasks) + 1, (h - 6) // 2))
+            y = 2
+            x = 1
+            for title, cw in cols:
+                self.put(y, x, title, curses.A_BOLD)
+                x += cw + 1
+            self.put(y, x, "LAST COMMIT", curses.A_BOLD)
+            rows = table_h - 1
+            if self.sel < self.top:
+                self.top = self.sel
+            elif self.sel >= self.top + rows:
+                self.top = self.sel - rows + 1
+            if not tasks:
+                msg = "no tasks yet - n: new task, R: other repos" if m.refreshed_at else "loading..."
+                self.put(y + 1, 2, msg, self.c("dim"))
+            for i, t in enumerate(tasks[self.top:self.top + rows]):
+                idx = self.top + i
+                ry = y + 1 + i
+                sel = idx == self.sel
+                base_attr = curses.A_REVERSE if sel else 0
+                if sel:
+                    self.put(ry, 0, " " * w, base_attr)
+                ahead = "" if t.ahead is None else "+%d" % t.ahead + ("/-%d" % t.behind if t.behind else "")
+                vals = [t.name, t.state, t.profile or "-", ahead, "yes" if t.review else "", t.updated or "-"]
+                if show_repo:
+                    vals.insert(0, t.repo)
+                x = 1
+                for (title, cw), v in zip(cols, vals):
+                    a = base_attr
+                    if title == "SESSION":
+                        a |= {"running": self.c("running"), "frozen": self.c("frozen"),
+                              "no agent": self.c("warn") | curses.A_BOLD}.get(t.state, self.c("dim"))
+                    self.put(ry, x, v[:cw], a, cw)
+                    x += cw + 1
+                self.put(ry, x, t.subject, base_attr)
+
+            # preview
+            py = y + table_h
+            mode = m.preview
+            if cur and mode == "screen" and not cur.session:
+                mode = "changes"
+            if cur is None:
+                title = " preview "
+            elif mode == "screen":
+                title = " screen: %s (%s, %s) " % (cur.name, cur.session[0], cur.state)
+            else:
+                title = " changes: agent/%s vs %s " % (cur.name, BASE)
+            hint = " Tab: %s " % ("changes" if mode == "screen" else "screen")
+            self.put(py, 0, "─" * w, self.c("dim"))
+            self.put(py, 2, title, curses.A_BOLD)
+            if cur and cur.session:
+                self.put(py, max(len(title) + 3, w - len(hint) - 2), hint, self.c("dim"))
+            body_h = h - py - 3
+            m.preview_lines = body_h
+            lines = []
+            if cur is not None:
+                if mode == "screen":
+                    got = m.screens.get(cur.key)
+                    lines = got[1] if got else ["(loading the agent's screen...)"]
+                else:
+                    lines = m.changes_for(cur)
+                    if not cur.session:
+                        lines = lines + ["", "no running session - u: start one, a: attach starts it too"
+                                         if cur.worktree else "no worktree on the host (task done or dropped)"]
+            if mode == "screen":
+                lines = lines[-body_h:] if body_h > 0 else []
+            for i, l in enumerate(lines[:max(body_h, 0)]):
+                self.put(py + 1 + i, 1, l)
+
+            # status line (or a rule), then the keys - always shown unless prompting
+            st = self.status_text()
+            if st:
+                self.put(h - 2, 0, " " + st, curses.A_BOLD if m.status_ok else self.c("err") | curses.A_BOLD)
+            else:
+                self.put(h - 2, 0, "─" * w, self.c("dim"))
+            if prompt is None:
+                self.draw_keys(h - 1, w, self.menu(cur))
+        if prompt is not None:
+            label, text, pos = prompt
+            room = w - len(label) - 3
+            start = max(0, pos - room + 1) if room > 0 else 0
+            self.put(h - 1, 1, label, curses.A_BOLD)
+            self.put(h - 1, 1 + len(label), text[start:start + room])
+            try:
+                curses.curs_set(1)
+                scr.move(h - 1, min(w - 2, 1 + len(label) + pos - start))
+            except curses.error:
+                pass
+        scr.refresh()
+
+    def menu(self, t):
+        """(key, label) pairs for the bottom line, most useful first; only the keys
+        that do something for the selected task t (all keys: ?)."""
+        m = self.m
+        items = []
+        if t is not None:
+            if t.gone:
+                items += [("u", "restart")]
+            elif t.session:
+                items += [("⏎", "attach"), ("s", "send"), ("x", "stop")]
+            elif t.worktree:
+                items += [("u", "start"), ("⏎", "shell")]
+            if t.clone and t.ref:
+                items += [("d", "diff"), ("t", "try"), ("m", "merge")]
+                if t.review:
+                    items += [("p", "pull"), ("P", "push")]
+            if t.worktree:
+                items += [("w", "wip")]
+            items += [("X", "drop")]
+        items += [("n", "new"), ("R", "repo"), ("A", "one repo" if m.view is None else "all repos"),
+                  ("o", "output")]
+        return items
+
+    def draw_keys(self, y, w, items):
+        """The menu: highlighted keys and their labels; what doesn't fit is
+        dropped from the end, but "? help  q quit" always stays at the right."""
+        tail = [("?", "help"), ("q", "quit")]
+        width = lambda its: sum(len(k) + len(l) + 4 for k, l in its)
+        room = w - 1 - width(tail)
+        shown_items = []
+        for it in items:
+            if width(shown_items + [it]) > room:
+                break
+            shown_items.append(it)
+        x = 0
+        for k, label in shown_items:
+            self.put(y, x, " %s " % k, self.c("key") or curses.A_REVERSE)
+            self.put(y, x + len(k) + 2, label)
+            x += len(k) + len(label) + 4
+        x = max(x, w - 1 - width(tail))
+        for k, label in tail:
+            self.put(y, x, " %s " % k, self.c("key") or curses.A_REVERSE)
+            self.put(y, x + len(k) + 2, label)
+            x += len(k) + len(label) + 4
+
+    def status_text(self):
+        """The status to show: while an action runs, with its time; a finished
+        one for STATUS_SECS; an error until the next key (see loop)."""
+        m, now = self.m, time.time()
+        if m.status != self.shown_status:
+            self.shown_status, self.status_since = m.status, now
+        if m.action:
+            return "[running %ds] %s" % (now - self.status_since, m.status)
+        if m.status and m.status_ok and now - self.status_since > STATUS_SECS:
+            m.status = self.shown_status = ""
+        return m.status
+
+    # -------------------------------------------------------------- input
+    def ask(self, label, initial=""):
+        """One line of input in the status line; None if cancelled (Esc)."""
+        buf, pos = list(initial), len(initial)
+        try:
+            while True:
+                self.draw(prompt=(label, "".join(buf), pos))
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    return "".join(buf)
+                if ch in ("\x1b", "\x07"):              # Esc, Ctrl+G
+                    return None
+                if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    if pos:
+                        del buf[pos - 1]
+                        pos -= 1
+                elif ch == curses.KEY_DC:
+                    if pos < len(buf):
+                        del buf[pos]
+                elif ch == curses.KEY_LEFT:
+                    pos = max(0, pos - 1)
+                elif ch == curses.KEY_RIGHT:
+                    pos = min(len(buf), pos + 1)
+                elif ch in (curses.KEY_HOME, "\x01"):
+                    pos = 0
+                elif ch in (curses.KEY_END, "\x05"):
+                    pos = len(buf)
+                elif ch == "\x15":                      # Ctrl+U
+                    del buf[:pos]
+                    pos = 0
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf.insert(pos, ch)
+                    pos += 1
+        finally:
+            curses.curs_set(0)
+
+    def confirm(self, question):
+        a = self.ask(question + " [y/N] ")
+        return a is not None and a.strip().lower() in ("y", "yes")
+
+    def notify(self, text, ok=False):
+        with self.m.lock:
+            self.m.status, self.m.status_ok = text, ok
+
+    def view(self, title, lines, follow=False):
+        """Full-screen scrollable text (help, output log)."""
+        top = None
+        while True:
+            h, w = self.scr.getmaxyx()
+            body = h - 2
+            last = max(0, len(lines) - body)
+            if top is None:
+                top = last if follow else 0
+            top = max(0, min(top, last))
+            self.scr.erase()
+            self.put(0, 0, (" %s " % title).ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            for i, l in enumerate(lines[top:top + body]):
+                self.put(1 + i, 1, l)
+            self.put(h - 1, 1, "j/k space/b g/G scroll   q/Esc back", self.c("dim"))
+            self.scr.refresh()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch in ("q", "\x1b", "\n", "\r", curses.KEY_ENTER):
+                return
+            top += {"j": 1, curses.KEY_DOWN: 1, "k": -1, curses.KEY_UP: -1, " ": body, curses.KEY_NPAGE: body,
+                    "b": -body, curses.KEY_PPAGE: -body, "g": -len(lines), curses.KEY_HOME: -len(lines),
+                    "G": len(lines), curses.KEY_END: len(lines)}.get(ch, 0)
+
+    def interactive(self, cmd, pause=False, cwd=None):
+        """Hand the terminal to cmd (attach, pagers), then come back."""
+        curses.def_prog_mode()
+        curses.endwin()
+        print(("(%s) " % cwd if cwd else "") + "$ " + shown(cmd), flush=True)
+        try:
+            rc = subprocess.call(cmd, cwd=cwd)
+        except FileNotFoundError as e:
+            rc = 127
+            print(e)
+        if pause or rc != 0:
+            try:
+                input("[exit %d] press Enter to go back " % rc)
+            except EOFError:
+                pass
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        self.m.wake_list.set()
+        self.m.wake_peek.set()
+        return rc
+
+    # -------------------------------------------------------------- actions
+    def need_task(self):
+        t = self.current()
+        if t is None:
+            self.notify("no task selected")
+        return t
+
+    def need_local(self, t):
+        if not t.clone:
+            self.notify("no local clone of %s found (git agent needs one; RCOI_TUI_ROOTS, see ?)" % t.repo)
+            return False
+        if not t.ref:
+            self.notify("no agent/%s branch here yet (r: refresh)" % t.name)
+            return False
+        return True
+
+    def act_new(self):
+        m = self.m
+        cur = self.current()
+        repo = m.view
+        if repo is None:
+            repo = self.choose("new task in which repo?", m.repos, cur.repo if cur else m.here)
+            if not repo:
+                return
+        if not valid_name(repo):
+            return self.notify("bad repo name: %s" % repo)
+        name = self.ask("new task in %s, name: " % repo)
+        if not name:
+            return
+        if not valid_name(name):
+            return self.notify("bad task name: %s (letters, digits, . _ -)" % name)
+        if any(t.key == (repo, name) for t in m.tasks):
+            return self.notify("%s already exists (u: start it, s: send to it)" % name)
+        profile = self.ask("profile (empty: the default): ")
+        if profile is None:
+            return
+        profile = profile.strip()
+        if profile and not valid_name(profile):
+            return self.notify("bad profile name: %s" % profile)
+        prompt = self.ask("prompt (empty: just start it): ")
+        if prompt is None:
+            return
+        opts = (["--profile", profile] if profile else []) + ["--bg"] + (["-p", prompt] if prompt.strip() else [])
+        clone = m.clones.get(repo)
+        if clone:
+            cmd = GIT_AGENT + ["new", name] + opts       # pushes main first if it's ahead
+        else:
+            cmd = RCOI + ["task", "new", repo, name] + opts
+        m.start_action("new %s" % name, [cmd], cwd=clone)
+
+    def act_restart(self, t):
+        if self.confirm("%s's agent is gone (container %s still up). restart it?" % (t.name, t.session[0])):
+            self.m.start_action("restart %s" % t.name, [RCOI + ["task", "stop", t.repo, t.name],
+                                                       RCOI + ["task", "shell", t.repo, t.name, "--bg"]])
+
+    def act_wip(self, t):
+        if not t.worktree:
+            return self.notify("no worktree for %s on the host" % t.name)
+        self.notify("wip %s ..." % t.name, True)
+        self.draw()
+        cmd = RCOI + ["task", "wip", t.repo, t.name]
+        rc, out = run(cmd, timeout=60)
+        lines = [clean(l) for l in out.splitlines()] or ["(no uncommitted changes)"]
+        self.notify("" if rc == 0 else "wip %s failed (exit %d)" % (t.name, rc), rc == 0)
+        self.view("uncommitted in %s (%s)" % (t.name, shown(cmd)), lines)
+
+    def act_start(self, t):
+        if t.gone:
+            return self.act_restart(t)
+        if t.session:
+            return self.notify("%s is already running (s: send, a: attach)" % t.name)
+        if not t.worktree:
+            return self.notify("no worktree for %s on the host" % t.name)
+        prompt = self.ask("start %s, prompt (empty: none): " % t.name)
+        if prompt is None:
+            return
+        cmd = RCOI + ["task", "shell", t.repo, t.name, "--bg"] + (["-p", prompt] if prompt.strip() else [])
+        self.m.start_action("start %s" % t.name, [cmd])
+
+    def act_send(self, t):
+        if t.gone:
+            return self.notify("%s's agent is gone (u: restart it)" % t.name)
+        if not t.session:
+            return self.notify("%s has no running session (u: start one)" % t.name)
+        text = self.ask("send to %s: " % t.name)
+        if text and text.strip():
+            self.m.start_action("send to %s" % t.name, [RCOI + ["task", "send", t.repo, t.name, text]])
+
+    def act_attach(self, t):
+        if t.gone:
+            self.act_restart(t)
+        elif t.session:
+            self.interactive(RCOI + ["task", "attach", t.repo, t.name])
+        elif t.worktree:
+            # No session: an interactive one, which reattaches next time.
+            if self.confirm("no session for %s; start an interactive one?" % t.name):
+                self.interactive(RCOI + ["task", "shell", t.repo, t.name])
+        else:
+            self.notify("no worktree for %s on the host" % t.name)
+
+    def act_key(self, ch):
+        m = self.m
+        if ch == "n":
+            return self.act_new()
+        if ch == "y":
+            cur = self.current()
+            repo = m.view or (cur.repo if cur else None)
+            if not repo or repo not in m.clones:
+                return self.notify("no local clone of %s found" % repo if repo else "no repo selected")
+            if self.confirm("push %s's local %s to the agent host?" % (repo, BASE)):
+                m.start_action("sync %s %s" % (repo, BASE), [GIT_AGENT + ["sync"]], cwd=m.clones[repo])
+            return
+        t = self.need_task()
+        if t is None:
+            return
+        if ch in ("a", "\n", "\r", curses.KEY_ENTER):
+            self.act_attach(t)
+        elif ch == "s":
+            self.act_send(t)
+        elif ch == "u":
+            self.act_start(t)
+        elif ch == "x":
+            if not t.session:
+                return self.notify("%s has no running session" % t.name)
+            if self.confirm("stop %s's session (the worktree stays)?" % t.name):
+                m.start_action("stop %s" % t.name, [RCOI + ["task", "stop", t.repo, t.name]])
+        elif ch in ("d", "l"):
+            if self.need_local(t):
+                self.interactive(GIT_AGENT + ["diff" if ch == "d" else "log", t.name], cwd=t.clone)
+        elif ch == "t":
+            if self.need_local(t) and self.confirm("check out agent/%s as review/%s (runs nothing yet)?" % (t.name, t.name)):
+                m.start_action("try %s" % t.name, [GIT_AGENT + ["try", t.name]], cwd=t.clone)
+        elif ch == "w":
+            self.act_wip(t)
+        elif ch == "c":
+            if not t.worktree:
+                return self.notify("no worktree for %s on the host" % t.name)
+            msg = self.ask("commit everything in %s's worktree, message (empty: default): " % t.name)
+            if msg is not None:
+                m.start_action("commit %s" % t.name,
+                               [RCOI + ["task", "commit", t.repo, t.name] + ([msg] if msg.strip() else [])])
+        elif ch == "p":
+            if self.need_local(t):
+                m.start_action("pull %s" % t.name, [GIT_AGENT + ["pull", t.name]], cwd=t.clone)
+        elif ch in ("P", "U"):
+            if not self.need_local(t):
+                return
+            if not t.review:
+                return self.notify("no review/%s here (t: try, p: pull)" % t.name)
+            if ch == "P":
+                if self.confirm("push review/%s to agent/%s on the host?" % (t.name, t.name)):
+                    m.start_action("push %s" % t.name, [GIT_AGENT + ["push", t.name]], cwd=t.clone)
+            elif self.confirm("merge local %s into review/%s and push it to the agent?" % (BASE, t.name)):
+                m.start_action("update %s" % t.name, [GIT_AGENT + ["update", t.name]], cwd=t.clone)
+        elif ch == "m":
+            ahead = "" if t.ahead is None else " (+%d)" % t.ahead
+            if self.need_local(t) and self.confirm("merge agent/%s%s into local %s?" % (t.name, ahead, BASE)):
+                m.start_action("merge %s" % t.name, [GIT_AGENT + ["merge", t.name]], cwd=t.clone)
+        elif ch == "D":
+            local = bool(t.clone)
+            q = "done %s: remove its worktree, session and branch on the host%s (merged work only)?" % (
+                t.name, " and review/%s in %s" % (t.name, os.path.basename(t.clone)) if local else "")
+            if self.confirm(q):
+                cmd = GIT_AGENT + ["done", t.name] if local else RCOI + ["task", "done", t.repo, t.name]
+                m.start_action("done %s" % t.name, [cmd], cwd=t.clone or None)
+        elif ch == "X":
+            local = bool(t.clone)
+            lost = "" if t.ahead is None else " (%d commit(s) not in %s)" % (t.ahead, BASE)
+            mine = " and review/%s in %s" % (t.name, os.path.basename(t.clone)) if local and t.review else ""
+            if self.confirm("DROP %s%s: discard its branch, worktree and session%s?" % (t.name, lost, mine)):
+                cmd = GIT_AGENT + ["drop", t.name, "-y"] if local else RCOI + ["task", "drop", t.repo, t.name, "-y"]
+                m.start_action("drop %s" % t.name, [cmd], cwd=t.clone or None)
+
+    def set_view(self, repo):
+        """Show one repo's tasks (None: all), keeping the selected task if it's still shown."""
+        m = self.m
+        cur = self.current()
+        with m.lock:
+            m.view = repo
+        tasks = m.visible()
+        keys = [t.key for t in tasks]
+        self.sel = keys.index(cur.key) if cur and cur.key in keys else 0
+        self.top = 0
+        m.wake_peek.set()
+
+    def choose(self, title, items, current=None):
+        """Pick one of items (j/k, Enter; Esc cancels; type to jump); None if cancelled."""
+        if not items:
+            self.notify("nothing to choose from yet (r: refresh)")
+            return None
+        sel = items.index(current) if current in items else 0
+        while True:
+            h, w = self.scr.getmaxyx()
+            self.scr.erase()
+            self.put(0, 0, (" %s " % title).ljust(w), curses.A_REVERSE | curses.A_BOLD)
+            body = h - 2
+            top = max(0, sel - body + 1)
+            counts = {}
+            for t in self.m.tasks:
+                counts[t.repo] = counts.get(t.repo, 0) + 1
+            for i, it in enumerate(items[top:top + body]):
+                idx = top + i
+                if it == "(all repos)":
+                    n, mark = len(self.m.tasks), ""
+                else:
+                    n = counts.get(it, 0)
+                    mark = self.m.clones.get(it, "(no local clone)")
+                    if it == self.m.view:
+                        mark += "   (shown now)"
+                attr = curses.A_REVERSE if idx == sel else 0
+                self.put(1 + i, 1, (" %-22s %3d task%s   %s" % (it, n, "" if n == 1 else "s", mark)).ljust(w - 2), attr)
+            self.put(h - 1, 1, "j/k select   Enter choose   Esc cancel", self.c("dim"))
+            self.scr.refresh()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                return items[sel]
+            if ch in ("\x1b", "q"):
+                return None
+            if ch in ("j", curses.KEY_DOWN):
+                sel = min(sel + 1, len(items) - 1)
+            elif ch in ("k", curses.KEY_UP):
+                sel = max(sel - 1, 0)
+            elif isinstance(ch, str) and ch.isprintable():
+                nxt = [i for i, it in enumerate(items) if it.lstrip("(").startswith(ch)]
+                if nxt:
+                    sel = next((i for i in nxt if i > sel), nxt[0])
+
+    # -------------------------------------------------------------- main loop
+    def loop(self):
+        m = self.m
+        while True:
+            self.draw()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            n = len(m.visible())
+            old = self.sel
+            with m.lock:
+                if not m.action and not m.status_ok:
+                    m.status, m.status_ok = "", True
+            if ch in ("q", "Q"):
+                return
+            elif ch in ("j", curses.KEY_DOWN):
+                self.sel = min(self.sel + 1, max(n - 1, 0))
+            elif ch in ("k", curses.KEY_UP):
+                self.sel = max(self.sel - 1, 0)
+            elif ch in ("g", curses.KEY_HOME):
+                self.sel = 0
+            elif ch in ("G", curses.KEY_END):
+                self.sel = max(n - 1, 0)
+            elif ch == "\t":
+                with m.lock:
+                    m.preview = "changes" if m.preview == "screen" else "screen"
+                m.wake_peek.set()
+            elif ch == "A":
+                cur = self.current()
+                self.set_view(None if m.view else (cur.repo if cur else m.here))
+            elif ch == "R":
+                cur = self.current()
+                # From one repo, start on "(all repos)"; from all, on the selected task's repo.
+                pick = self.choose("show the tasks of (Enter: show, Esc: back)", ["(all repos)"] + m.repos,
+                                   "(all repos)" if m.view else (cur.repo if cur else None))
+                if pick:
+                    self.set_view(None if pick == "(all repos)" else pick)
+            elif ch == "r":
+                self.notify("refreshing...", True)
+                m.wake_list.set()
+                m.wake_peek.set()
+            elif ch == "o":
+                with m.lock:
+                    log = list(m.log)
+                self.view("output (newest at the bottom)", log or ["(no commands run yet)"], follow=True)
+            elif ch == "?":
+                self.view("rcoi-tui help", HELP)
+            elif ch == curses.KEY_RESIZE:
+                pass
+            else:
+                self.act_key(ch)
+            if self.sel != old:
+                m.wake_peek.set()
+
+
+def ssh_mux():
+    """Share one SSH connection between all the rcoi and git calls.
+
+    Returns a cleanup function. Every peek is an SSH login otherwise."""
+    d = tempfile.mkdtemp(prefix="rcoi-", dir="/tmp")    # short: socket paths are limited
+    opts = "-o ControlMaster=auto -o ControlPath=%s/%%C -o ControlPersist=60" % d
+    os.environ["RCOI_SSH_OPTS"] = (os.environ.get("RCOI_SSH_OPTS", "") + " " + opts).strip()
+    if not os.environ.get("GIT_SSH_COMMAND") and not git_out("config", "core.sshCommand"):
+        os.environ["GIT_SSH_COMMAND"] = "ssh " + opts
+
+    def cleanup(host):
+        if host:
+            run(["ssh", "-o", "ControlPath=%s/%%C" % d, "-O", "exit", host], timeout=5)
+        shutil.rmtree(d, ignore_errors=True)
+    return cleanup
+
+
+def main(argv):
+    all_repos, mux, interval = False, True, 2.0
+    args = list(argv)
+    while args:
+        a = args.pop(0)
+        if a in ("-a", "--all"):
+            all_repos = True
+        elif a == "--no-mux":
+            mux = False
+        elif a == "--interval" and args:
+            try:
+                interval = max(0.5, float(args.pop(0)))
+            except ValueError:
+                sys.exit("rcoi-tui: --interval needs a number of seconds")
+        elif a in ("-h", "--help", "help"):
+            print(__doc__.strip())
+            return 0
+        else:
+            print(__doc__.strip().splitlines()[2], file=sys.stderr)
+            return 2
+
+    host = os.environ.get("RCOI_HOST", "")
+    if not host and os.path.exists(CONF):
+        with open(CONF) as f:
+            host = f.readline().strip()
+    if not host:
+        sys.exit("rcoi-tui: no host: set RCOI_HOST or put user@host into %s (install.sh --host)" % CONF)
+
+    # The repo we're in, by its name on the host (the local folder may be
+    # named differently), and the local clones of the others.
+    top = git_out("rev-parse", "--show-toplevel")
+    here = (host_repo(top) or os.path.basename(top)) if top else None
+    clones = find_clones(roots(top), top or None)
+
+    cleanup = ssh_mux() if mux else None
+    model = Model(host, here, clones, all_repos)
+    threading.Thread(target=model.list_loop, daemon=True).start()
+    threading.Thread(target=model.peek_loop, args=(interval,), daemon=True).start()
+
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: UI(scr, model, interval).loop())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if cleanup:
+            cleanup(host)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
