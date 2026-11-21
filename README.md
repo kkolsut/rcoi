@@ -96,7 +96,16 @@ It installs `rcoi` and `git-agent` into `~/.local/bin` (no sudo) and writes
 the host into `~/.config/rcoi/host`. It then checks:
 - that `~/.local/bin` is on your PATH, and prints the line to add if it isn't;
 - that SSH logs in without a password, and suggests `ssh-copy-id` if it doesn't;
-- that `coi` and `coi-task` are found on the agent host.
+- that `coi` is found on the agent host;
+- that `coi-task` there is the same as this folder's. If it's missing or
+  differs, it asks whether to install it there: it copies it over SSH and
+  runs `install` (with `sudo` if the folder isn't writable, so sudo may ask
+  for your password on the host).
+
+So after `git pull` here, one `./install.sh` updates both machines.
+`--update-host` installs without asking (e.g. from a script), `--no-host`
+skips the host. Installing on the host directly (`./install.sh --agent-host`
+there) still works.
 
 On **macOS**, `~/.local/bin` isn't on the PATH by default. Add it to
 `~/.zshrc` and open a new terminal:
