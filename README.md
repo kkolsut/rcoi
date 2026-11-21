@@ -2,7 +2,7 @@
 
 Run AI agents (Claude Code, Codex) in [Coi](https://github.com/coipond/coi)
 containers on a remote agent host, from your laptop, over plain SSH. Three
-small bash scripts:
+small bash scripts, and a terminal UI on top of them:
 
 - **`rcoi`** (your machine): runs `coi` (or `coi-task`) on the agent host,
   with Coi's own command syntax: `rcoi list`, `rcoi attach <ct>`, `rcoi task new …`.
@@ -12,6 +12,9 @@ small bash scripts:
   agent host needs no GitHub (or other forge) credentials.
 - **`coi-task`** (agent host): one git worktree + branch + Coi session per
   task. It starts agents in the background, types prompts in, and cleans up.
+- **`rcoi-tui`** (your machine, optional): one screen for a repo's tasks, their
+  branches and each agent's live screen, with keys for the commands above.
+  See [Terminal UI](#terminal-ui).
 
 ```bash
 git agent init                                   # once per repo: send it to the agent host
@@ -39,16 +42,18 @@ runs its `coi supervise` monitor there. `rcoi` runs it there for you:
 4. [Task lifecycle](#task-lifecycle)
 5. [Models, profiles and Codex](#models-profiles-and-codex)
 6. [Recipes](#recipes)
-7. [Command reference](#command-reference)
-8. [Settings](#settings)
-9. [Troubleshooting](#troubleshooting)
-10. [Things to know](#things-to-know)
-11. [Security](#security)
+7. [Terminal UI](#terminal-ui)
+8. [Command reference](#command-reference)
+9. [Settings](#settings)
+10. [Troubleshooting](#troubleshooting)
+11. [Things to know](#things-to-know)
+12. [Security](#security)
 
 ## Requirements
 
 - **Your machine (Linux or macOS):** bash 3.2 or newer (macOS's built-in
-  `/bin/bash` is fine, also when your shell is zsh), OpenSSH client, git.
+  `/bin/bash` is fine, also when your shell is zsh), OpenSSH client, git;
+  Python 3.8+ for `rcoi-tui` (standard library only).
 - **Agent host (Linux):**
   - Coi + Incus, working for the user you log in as (`coi shell` works there);
     tested with Coi v0.16.0;
@@ -92,7 +97,7 @@ limits, protected branches and so on are up to you. See Coi's docs.
 ./install.sh --host you@agent-host
 ```
 
-It installs `rcoi` and `git-agent` into `~/.local/bin` (no sudo) and writes
+It installs `rcoi`, `git-agent` and `rcoi-tui` into `~/.local/bin` (no sudo) and writes
 the host into `~/.config/rcoi/host`. It then checks:
 - that `~/.local/bin` is on your PATH, and prints the line to add if it isn't;
 - that SSH logs in without a password, and suggests `ssh-copy-id` if it doesn't;
@@ -451,6 +456,57 @@ rcoi task send myrepo big-refactor "Stop after the current module and commit."
 ```bash
 rcoi task new myrepo ci-check -- make test
 ```
+
+## Terminal UI
+
+```bash
+cd myrepo && rcoi-tui        # starts with this repo's tasks; R: another repo, A: all repos
+rcoi-tui --all               # every repo's tasks (also the default outside a repo)
+```
+
+```
+ rcoi-tui   host: you@agent-host   repo: myrepo
+ main in sync
+ TASK               SESSION   PROFILE    +/-     REVIEW UPDATED          LAST COMMIT
+ check              running   -          +3      yes    5 minutes ago    add star catalogue check
+ tui                no agent  -          +7             2 hours ago      curses front end
+ new-ui             stopped   codex      +0             3 days ago       start
+── screen: check (coi-f90e18aa-1, running) ───────────────────────── Tab: changes ──
+ (the agent's screen, refreshed every 2 seconds)
+```
+
+It is a front end only: every key runs `rcoi` or `git agent`, and `o` shows
+the commands it ran and their output.
+
+`git agent` needs a local clone, so rcoi-tui looks for yours: every repo with
+an `agentvm` remote one or two levels below `~/Projects`, `~/src`, `~/code`
+and the folder holding the repo you started in (set `RCOI_TUI_ROOTS`,
+colon-separated, to look elsewhere). Each repo's `git agent` commands run in
+its own clone (`new` pushes main first, `done`/`drop` also delete
+`review/<task>` there). For a repo without a clone the git keys are off and
+`new`/`done`/`drop` use `rcoi task`. `R` lists the repos with their clones.
+
+| Key | Does | Key | Does |
+|---|---|---|---|
+| `R` | pick a repo | `A` | one repo / all repos |
+| `Enter`, `a` | attach (detach: Ctrl+B, d) | `n` | new task (`--bg`, optional prompt) |
+| `s` | send text to the agent | `u` | start a session (restarts a dead one) |
+| `x` | stop the session | `w` | the agent's uncommitted changes |
+| `c` | commit them on the host | `d` / `l` | diff / log in your pager |
+| `t` | try (`review/<task>`) | `p` / `P` | pull / push `review/<task>` |
+| `U` | update `review/<task>` with main | `m` | merge into main |
+| `D` | done (merged only) | `X` | drop (asks first) |
+| `y` | sync main to the host | `Tab` | preview: screen / changes |
+| `r` | refresh | `?` | help |
+
+SESSION **no agent** means the container still runs but the agent's tmux
+session is gone: the agent exited, or killed the tmux server in its container
+(e.g. `tmux kill-server` while testing a terminal app). `rcoi task list` still
+says `running` then. `u` restarts it (stop + start; worktree and commits stay).
+
+Options: `--all` (start with every repo), `--interval SECONDS` (screen refresh, default 2),
+`--no-mux` (by default it shares one SSH connection between its commands).
+Tests: `python3 -m unittest discover tests` (fake `rcoi`/`git-agent`, no host needed).
 
 ## Command reference
 

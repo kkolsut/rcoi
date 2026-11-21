@@ -2,7 +2,7 @@
 # install.sh - install rcoi (Linux, macOS).
 #
 # On your machine (laptop/workstation):
-#   ./install.sh --host user@agent-host     rcoi + git-agent into ~/.local/bin, set the agent host
+#   ./install.sh --host user@agent-host     rcoi, git-agent, rcoi-tui into ~/.local/bin, set the agent host
 #   ./install.sh                            update them, keep the host setting
 #   ./install.sh --uninstall                remove them (the host setting stays)
 #   Then it checks coi-task on the agent host and, if it's missing or differs
@@ -48,7 +48,7 @@ if [[ $side == agent ]]; then
   tools="coi-task"
   prefix=${prefix:-/usr/local/bin}   # on the PATH of non-interactive SSH sessions
 else
-  tools="rcoi git-agent"
+  tools="rcoi git-agent rcoi-tui"
   prefix=${prefix:-$HOME/.local/bin}
 fi
 
@@ -93,6 +93,7 @@ if [[ $side == agent ]]; then
 fi
 
 # ------------------------------------------------------------- your machine
+command -v python3 >/dev/null || say "note: rcoi-tui needs python3 (the other tools don't)"
 conf="${XDG_CONFIG_HOME:-$HOME/.config}/rcoi/host"
 if [[ -n $host ]]; then
   mkdir -p "$(dirname "$conf")"
