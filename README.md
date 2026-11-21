@@ -194,13 +194,33 @@ Modes for `new` / `shell`:
 
 **3. See progress**
 ```bash
-rcoi task list                 # tasks, whether their session is running, their profile
+rcoi task list                 # tasks, their session and profile, what each agent is doing, its work
+rcoi task status myrepo sum    # just this one: e.g. "waiting   +4 commits, 3 uncommitted"
 rcoi task peek myrepo sum      # the agent's screen (add a number for more lines: peek myrepo sum 100)
 git agent list                 # agent branches and their latest commit
 rcoi task wait myrepo sum      # block until the agent is idle again (optional timeout
                                # in seconds), e.g.: rcoi task wait myrepo sum && git agent list
 ```
-`list` (and `try`) flag a task with `nothing new vs main` (the agent hasn't
+`rcoi task list` adds `agent: …` for each running session and `work: …` for
+each task, e.g.:
+```
+/home/you/src/myrepo-sum   56205aa [agent/sum]   session: coi-f90e18aa-1 running   agent: waiting   work: +1 commit, clean
+```
+
+| agent | meaning |
+|---|---|
+| `working` | busy (its screen shows "esc to interrupt") |
+| `waiting` | its turn ended: it's done, or wants a reply. With `work: …, clean` and commits, it's usually finished |
+| `asking` | a question or approval on screen: answer it with `rcoi task attach` |
+| `no agent` | the container runs, but the agent's tmux session is gone (it exited, or killed the tmux server): `rcoi task stop`, then start it again |
+| `starting` | none of these yet |
+
+It reads the bottom of each agent's screen (Claude and Codex), all sessions at
+once, so `list` takes about half a second longer with running sessions. It's
+best effort: a new agent version that changes its screen text can confuse it
+(`wait` reads the same signs).
+
+`git agent list` (and `try`) flag a task with `nothing new vs main` (the agent hasn't
 committed yet, or it's merged already) or `uncommitted changes on the host`
 (its worktree has edits that aren't in any commit, so `diff`/`try` can't see
 them yet). Either way: let it finish, or look and commit yourself:
@@ -467,11 +487,12 @@ rcoi-tui --all               # every repo's tasks (also the default outside a re
 ```
  rcoi-tui   host: you@agent-host   repo: myrepo
  main in sync
- TASK               SESSION   PROFILE    +/-     REVIEW UPDATED          LAST COMMIT
- check              running   -          +3      yes    5 minutes ago    add star catalogue check
- tui                no agent  -          +7             2 hours ago      curses front end
- new-ui             stopped   codex      +0             3 days ago       start
-── screen: check (coi-f90e18aa-1, running) ───────────────────────── Tab: changes ──
+ TASK               AGENT     WIP  PROFILE    +/-     REVIEW UPDATED          LAST COMMIT
+ check              waiting        -          +3      yes    5 minutes ago    add star catalogue check
+ parser             working   4    codex      +1             1 minute ago     split the lexer
+ tui                no agent       -          +7             2 hours ago      curses front end
+ new-ui             stopped        codex      +0             3 days ago       start
+── screen: check (coi-f90e18aa-1, waiting) ───────────────────────── Tab: changes ──
  (the agent's screen, refreshed every 2 seconds)
 ```
 
@@ -499,10 +520,15 @@ its own clone (`new` pushes main first, `done`/`drop` also delete
 | `y` | sync main to the host | `Tab` | preview: screen / changes |
 | `r` | refresh | `?` | help |
 
-SESSION **no agent** means the container still runs but the agent's tmux
-session is gone: the agent exited, or killed the tmux server in its container
-(e.g. `tmux kill-server` while testing a terminal app). `rcoi task list` still
-says `running` then. `u` restarts it (stop + start; worktree and commits stay).
+AGENT is what the agent is doing, from `rcoi task list` (see
+[See progress](#task-lifecycle)): **waiting** (bold) and **asking** are your
+turn; Enter attaches to answer. WIP is the number of uncommitted files in its
+worktree (`w` shows them, `c` commits them). **no agent** means the container
+still runs but the agent's tmux session is gone: the agent exited, or killed
+the tmux server in its container (e.g. `tmux kill-server` while testing a
+terminal app). `u` restarts it (stop + start; worktree and commits stay).
+With an older `coi-task` on the host, AGENT only says `running`: update it
+with `./install.sh`.
 
 Options: `--all` (start with every repo), `--interval SECONDS` (screen refresh, default 2),
 `--no-mux` (by default it shares one SSH connection between its commands).
@@ -525,13 +551,14 @@ shell  <repo> <task> [--profile P] [mode]   start the agent in an existing task 
 attach <repo> <task>                         live session (detach: Ctrl+B, d)
 peek   <repo> <task> [lines]                 print the screen (default 40 lines)
 send   <repo> <task> "text"                  type text + Enter
-wait   <repo> <task> [secs]                  until the agent is idle (default: no timeout)
+wait   <repo> <task> [secs]                  until the agent is idle or asks you (default: no timeout)
+status <repo> <task>                         what the agent is doing, commits, uncommitted files
 wip    <repo> <task> [--color]               uncommitted changes in the worktree (git agent wip)
 commit <repo> <task> ["msg"]                 commit everything in the worktree (git add -A)
 stop   <repo> <task>                         end the session, keep the worktree
 done   <repo> <task>                         stop + remove worktree + branch (merged only)
 drop   <repo> <task> [-y]                    the same, discarding unmerged work
-list   [<repo>]                              tasks, sessions, profiles
+list   [<repo>]                              tasks, sessions, profiles, agent state, work
 remove <repo> [-y]                           drop every task, delete ~/src/<repo> (git agent remove)
 ```
 
