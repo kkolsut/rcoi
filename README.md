@@ -133,12 +133,12 @@ Run everything on your machine, inside your repo (here `~/code/myrepo`, task
 cd ~/code/myrepo
 git agent init                 # once per repo: creates ~/src/myrepo on the host, adds the 'agentvm' remote, pushes main
 
-rcoi task new myrepo sum --bg -p 'summarize the project into sum.md, then commit'
+git agent new sum --bg -p 'summarize the project into sum.md, then commit'
 rcoi task peek myrepo sum      # the agent's screen right now
 
 git agent diff sum             # read what changed
 git agent merge sum            # merge agent/sum into main (--no-ff)
-rcoi task done myrepo sum      # stop the session, remove worktree + branch on the host
+git agent done sum             # stop the session, remove worktree + branch on the host
 ```
 
 ## Task lifecycle
@@ -152,16 +152,21 @@ git agent sync        # after each new commit on main, so new tasks start from i
 > `git agent connect` there instead of `init`: it only adds the remote.
 
 > A task starts from whatever `main` is **on the agent host**. If you forget
-> `git agent sync`, the agent works on stale code.
+> `git agent sync`, the agent works on stale code. `git agent new` (below)
+> syncs for you.
 
 **2. Start an agent with a prompt**
 ```bash
-rcoi task new myrepo sum --bg -p 'summarize the project into sum.md, then commit'
-rcoi task new myrepo sum --profile codex --bg -p '…'   # the same with Codex (see Profiles)
+git agent new sum --bg -p 'summarize the project into sum.md, then commit'
+git agent new sum --profile codex --bg -p '…'   # the same with Codex (see Profiles)
 ```
-This creates the worktree `~/src/myrepo-sum` on branch `agent/sum`, starts the
-agent in a background session, and types the prompt in once it's ready. In an
-existing task, use `shell` instead of `new`.
+`git agent new <task> ...` is `rcoi task new myrepo <task> ...` with the repo
+name taken from the current repo, and it pushes your `main` first when it's
+ahead of the host's (a fast-forward only; `--no-sync` skips that, and a `main`
+that differs on the host is only warned about). It creates the worktree
+`~/src/myrepo-sum` on branch `agent/sum`, starts the agent in a background
+session, and types the prompt in once it's ready. In an existing task, use
+`rcoi task shell` instead.
 
 Modes for `new` / `shell`:
 
@@ -178,11 +183,18 @@ Modes for `new` / `shell`:
 rcoi task list                 # tasks, whether their session is running, their profile
 rcoi task peek myrepo sum      # the agent's screen (add a number for more lines: peek myrepo sum 100)
 git agent list                 # agent branches and their latest commit
+rcoi task wait myrepo sum      # block until the agent is idle again (optional timeout
+                               # in seconds), e.g.: rcoi task wait myrepo sum && git agent list
 ```
 `list` (and `try`) flag a task with `nothing new vs main` (the agent hasn't
 committed yet, or it's merged already) or `uncommitted changes on the host`
 (its worktree has edits that aren't in any commit, so `diff`/`try` can't see
-them yet). Either way: let it finish, or `rcoi task send myrepo sum 'commit your work'`.
+them yet). Either way: let it finish, or look and commit yourself:
+```bash
+git agent wip sum              # the uncommitted changes, straight from the host's worktree
+rcoi task commit myrepo sum    # commit them all there (optional message as 3rd argument)
+rcoi task send myrepo sum 'commit your work'    # or let the agent do it
+```
 
 **4. Follow up or take over**
 ```bash
@@ -215,21 +227,27 @@ worktree (let it commit or stop it first): your push never overwrites its work.
 The agent host needs git 2.35 or newer for this (older git moves the branch
 under the worktree without updating its files).
 
+`main` moved on while the task runs? `git agent update sum` brings the agent's
+commits into `review/sum`, merges your `main` there and pushes the result, so
+the agent continues on top of the newer code (tell it, as after `push`). On a
+conflict it stops: resolve it on `review/sum`, commit, then `git agent push sum`.
+
 **6a. Keep it**
 ```bash
-git switch main
-git agent merge sum
-git push origin main && git agent sync
-rcoi task done myrepo sum      # merged work only
-git branch -D review/sum       # if you used try
+git agent merge sum            # merges review/sum if it has your commits on top of the
+                               # agent's (so they aren't left out), else agent/sum
+git push origin main
+git agent done sum             # pushes main to the host, removes the task there
+                               # (session, worktree, agent/sum) and review/sum here
 ```
+`done` refuses unless both `agent/sum` and `review/sum` are merged into `main`.
 
 **6b. Discard it**
 ```bash
-rcoi task drop myrepo sum      # asks first; -y skips the question
-git switch main && git branch -D review/sum    # only if you used try
-git agent list                 # drops agentvm/agent/sum locally too
+git agent drop sum             # lists what's lost, asks first (-y skips the question);
+                               # removes the same things as done
 ```
+(`rcoi task done` / `rcoi task drop` do only the host's part.)
 
 **7. Remove the repo from the agent host** (when you're done with it there)
 ```bash
@@ -442,6 +460,9 @@ shell  <repo> <task> [--profile P] [mode]   start the agent in an existing task 
 attach <repo> <task>                         live session (detach: Ctrl+B, d)
 peek   <repo> <task> [lines]                 print the screen (default 40 lines)
 send   <repo> <task> "text"                  type text + Enter
+wait   <repo> <task> [secs]                  until the agent is idle (default: no timeout)
+wip    <repo> <task> [--color]               uncommitted changes in the worktree (git agent wip)
+commit <repo> <task> ["msg"]                 commit everything in the worktree (git add -A)
 stop   <repo> <task>                         end the session, keep the worktree
 done   <repo> <task>                         stop + remove worktree + branch (merged only)
 drop   <repo> <task> [-y]                    the same, discarding unmerged work
@@ -455,14 +476,21 @@ git agent init          create ~/src/<repo> on the agent host, add the 'agentvm'
 git agent connect       only add the 'agentvm' remote (repo already on the host, e.g. init from another machine)
 git agent remove [-y]   delete ~/src/<repo> + its tasks on the host, then the 'agentvm' remote (asks first)
 git agent sync          push main to the agent host (never forced)
-git agent list          fetch and list the agent branches (newest first)
+git agent new <task> [--no-sync] [--profile P] [mode]
+                        rcoi task new <this repo> <task> ..., syncing main first if it's ahead
+git agent list          fetch and list the agent branches (newest first), flag unfinished ones
+git agent wip  [task]   the agent's uncommitted changes on the host
 git agent diff <task>   what the agent changed since it branched off main
 git agent log  <task>   the same, commit by commit
 git agent try  <task>   check it out as review/<task> (again: fast-forward it)
 git agent pull [task]   agent's new commits -> review/<task> (merge; creates it if missing)
 git agent push [task]   review/<task> -> agent/<task> on the host (never forced)
-git agent merge <task>  merge it into main
+git agent update [task] merge main into review/<task>, then push it
+git agent merge <task>  merge review/<task> (if it has your commits) or agent/<task> into main
+git agent done [task]   sync main, remove the task on the host and review/<task> (merged only)
+git agent drop [task] [-y]  the same for unmerged work: discards it (asks first)
 ```
+`[task]` defaults to the task of the current `review/<task>` branch.
 
 Your repo only fetches `agent/*` branches from the agent host
 (`+refs/heads/agent/*:refs/remotes/agentvm/agent/*`). So an agent can't replace
@@ -506,8 +534,9 @@ calls ssh itself.
 | "Codex is not logged in" | `~/.codex/auth.json` is missing or expired on the host. See [Codex](#codex). |
 | "agent not ready after 180s" | Look with `rcoi task attach`. `COI_TASK_READY_TIMEOUT` raises the wait. |
 | `git agent init`: "already exists" | The repo is on the host already (init from another machine). Use `git agent connect`. |
-| The agent worked on old code | You forgot `git agent sync` before `task new`. |
-| `task done` refuses | The branch isn't merged. Merge it (`git agent merge`) or use `drop`. |
+| The agent worked on old code | You forgot `git agent sync` before `rcoi task new` (`git agent new` syncs). Catch up: `git agent update <task>`. |
+| `try`/`diff` show no changes | The agent hasn't committed: `git agent wip <task>` shows its work, `rcoi task commit <repo> <task>` commits it. |
+| `done` refuses | The branch isn't merged. Merge it (`git agent merge`) or use `drop`. |
 | Wrong model | `rcoi task peek <repo> <task> 10` shows it. Check the task's profile in `rcoi task list`. |
 | A session is gone but the container is stuck | `rcoi list`, then `rcoi shutdown <ct>` (or `rcoi kill <ct>`). |
 | zsh: "no matches found" | Quote your prompts. zsh refuses an unquoted word with `?` or `*` that matches no file. |

@@ -19,6 +19,12 @@
 #   coi-task attach <repo> <task>          attach to the background session (detach: Ctrl+B, then d)
 #   coi-task peek   <repo> <task> [lines]  print the session's screen (default 40 lines)
 #   coi-task send   <repo> <task> "text"   type text + Enter into the session
+#   coi-task wait   <repo> <task> [secs]   wait until the agent is idle (its input box is back);
+#                                          gives up after secs (default: never)
+#   coi-task wip    <repo> <task> [--color]
+#                                          the task worktree's uncommitted changes (status + diff)
+#   coi-task commit <repo> <task> ["msg"]  commit everything in the task worktree (git add -A),
+#                                          e.g. when the agent stopped without committing
 #   coi-task stop   <repo> <task>          shut the task's session down (the worktree stays)
 #   coi-task done   <repo> <task>          stop + remove the worktree + delete agent/<task> (merged only)
 #   coi-task drop   <repo> <task> [-y]     the same for unmerged work: discards it (asks first)
@@ -365,6 +371,72 @@ cmd_send() {
   tmux_send "$ct" "$3"
 }
 
+# Idle = the agent's footer is on screen without the "esc to interrupt" that
+# Claude and Codex show while they work, three checks in a row (an agent can
+# pause briefly between steps). Right after a send the agent may not have
+# started yet; that's what the repeated checks are for, too.
+cmd_wait() {
+  [[ $# -eq 2 || $# -eq 3 ]] || usage 1
+  local timeout=${3:-0}
+  [[ $timeout =~ ^[0-9]+$ ]] || usage 1
+  TASK_REPO=$1 TASK_NAME=$2
+  local wt ct screen idle=0 start=$SECONDS
+  wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
+  while :; do
+    containers "$wt" | grep -qxF -- "$ct" || die "session $ct ended"
+    screen=$(coi tmux capture "$ct" 2>/dev/null || true)
+    if grep -qi 'esc to interrupt' <<<"$screen"; then
+      idle=0
+    elif grep -qE 'bypass permissions|for shortcuts|context left' <<<"$screen"; then
+      idle=$((idle + 1))
+      if ((idle >= 3)); then say "$ct is idle"; return 0; fi
+    else
+      idle=0
+    fi
+    if ((timeout && SECONDS - start >= timeout)); then
+      die "$ct still busy after ${timeout}s (look: coi-task peek $1 $2)"
+    fi
+    sleep 3
+  done
+}
+
+cmd_wip() {
+  [[ $# -eq 2 || ( $# -eq 3 && $3 == --color ) ]] || usage 1
+  local wt; wt=$(wt_dir "$1" "$2")
+  if [[ -z $(git -C "$wt" status --porcelain) ]]; then
+    say "no uncommitted changes in $wt"; return 0
+  fi
+  local g=(git); [[ ${3:-} == --color ]] && g=(git -c color.ui=always)
+  cd "$wt"
+  "${g[@]}" status --short
+  echo
+  "${g[@]}" diff HEAD
+  # New files aren't in `diff HEAD` (and `add -N` would touch the agent's
+  # index), so show each one as added. --no-index exits 1 on a difference.
+  local f
+  while IFS= read -r -d '' f; do
+    "${g[@]}" diff --no-index -- /dev/null "$f" || true
+  done < <(git ls-files -z --others --exclude-standard)
+}
+
+cmd_commit() {
+  [[ $# -eq 2 || ( $# -eq 3 && -n $3 ) ]] || usage 1
+  local wt; wt=$(wt_dir "$1" "$2")
+  local msg=${3:-"WIP: uncommitted work from the agent session"}
+  [[ -n $(git -C "$wt" status --porcelain) ]] || { say "nothing to commit in $wt"; return 0; }
+  if [[ -n $(containers "$wt") ]]; then
+    say "note: the session is still running - the agent may still be changing files"
+  fi
+  # This host's git identity, else a neutral one (git refuses to commit without).
+  local id=()
+  if ! git -C "$wt" config user.name >/dev/null || ! git -C "$wt" config user.email >/dev/null; then
+    id=(-c user.name=coi-task -c "user.email=coi-task@${HOSTNAME:-localhost}")
+  fi
+  git -C "$wt" add -A
+  git -C "$wt" ${id[@]+"${id[@]}"} commit -q -m "$msg"
+  say "committed on agent/$2: $(git -C "$wt" log -1 --format='%h %s')"
+}
+
 cmd_stop() {
   [[ $# -eq 2 ]] || usage 1
   local wt; wt=$(wt_dir "$1" "$2")
@@ -483,7 +555,7 @@ cmd_list() {
 }
 
 case "${1:-}" in
-  init|new|shell|attach|peek|send|stop|done|drop|list|remove) c=$1; shift; "cmd_$c" "$@" ;;
+  init|new|shell|attach|peek|send|wait|wip|commit|stop|done|drop|list|remove) c=$1; shift; "cmd_$c" "$@" ;;
   -h|--help|help|"") usage 0 ;;
   *) usage 1 ;;
 esac

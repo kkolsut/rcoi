@@ -30,8 +30,13 @@ usage: git agent <command> [task]
   remove [-y]   delete ~/src/<repo> and its tasks on the agent host, then the '$REMOTE' remote
                 (asks first; unmerged agent branches there are lost)
   sync          push $BASE to the agent host (agents start new tasks from it)
+  new <task> [--no-sync] [--profile P] [mode]
+                rcoi task new <repo> <task> ... for this repo (mode: --bg [-p "..."],
+                -p "...", see rcoi task help); pushes $BASE first if it's ahead of the host's
   list          fetch and list the agent branches (newest first), flagging those with
                 nothing new vs $BASE or uncommitted changes in the host's worktree
+  wip  [task]   the agent's uncommitted changes in its worktree on the host
+                (commit them there: rcoi task commit <repo> <task>)
   diff <task>   what the agent changed since it branched off $BASE
   log  <task>   the same, commit by commit
   try  <task>   check it out as review/<task> (this runs the agent's code: read the diff first);
@@ -39,10 +44,17 @@ usage: git agent <command> [task]
   pull [task]   bring the agent's new commits into review/<task> (creates it if missing)
   push [task]   send your commits on review/<task> to agent/<task> on the agent host,
                 so the agent continues from them (never forced: pull first if it moved)
-  merge <task>  merge it into $BASE (then: git push origin $BASE && git agent sync)
+  update [task] merge your $BASE into review/<task> and push it, so the agent works on top
+                of the newer code
+  merge <task>  merge it into $BASE: review/<task> if it has your commits on top of the
+                agent's, else agent/<task> (then: git push origin $BASE && git agent done)
+  done [task]   after merge: push $BASE to the host, remove the task there (worktree,
+                session, agent/<task>) and review/<task> here; refuses unmerged work
+  drop [task] [-y]
+                discard a task, merged or not: the same removal, after asking
 
-  <task> is the name given to 'rcoi task new <repo> <task>'; pull and push
-  default to the task of the current review/<task> branch.
+  <task> is the name given to 'git agent new' / 'rcoi task new <repo> <task>';
+  where it's optional, it defaults to the task of the current review/<task> branch.
   Host: ${HOST:-<not set>} (AGENTVM_HOST, RCOI_HOST or $conf).
   Env: AGENTVM_REMOTE ($REMOTE), AGENTVM_BASE ($BASE).
 EOF
@@ -53,6 +65,33 @@ case ${1:-help} in help|-h|--help) usage; exit 0 ;; esac
 top=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repo"
 cd "$top"
 repo=$(basename "$top")
+
+# The repo's name and host on the agent host come from the '$REMOTE' remote
+# (user@host:src/<name>) once there is one; before that, from this dir and $HOST.
+hrepo=$repo rhost=$HOST
+if url=$(git remote get-url "$REMOTE" 2>/dev/null) && [[ $url == ?*:?* && $url != *://* ]]; then
+  rhost=${url%%:*}; hrepo=$(basename "${url#*:}")
+fi
+
+# Run coi-task on the agent host: coi_task [-t] <args...>
+# (-t: a terminal for it, when we have one). Every argument arrives as given.
+coi_task() {
+  local tty=-T cmd
+  if [[ ${1:-} == -t ]]; then
+    shift
+    if [[ -t 0 && -t 1 ]]; then tty=-t; fi
+  fi
+  [[ -n $rhost ]] || die "no agent host: put user@host into $conf (or set RCOI_HOST)"
+  printf -v cmd '%q ' coi-task "$@"
+  # shellcheck disable=SC2029  # quoted above with %q, for the remote shell
+  ssh "$tty" -o LogLevel=ERROR "$rhost" "$cmd"
+}
+
+valid_task() {
+  [[ $1 =~ ^[A-Za-z0-9._-]+$ ]] || die "bad task name: $1"
+}
+
+on_branch() { [[ $(git symbolic-ref -q --short HEAD || true) == "$1" ]]; }
 
 need_remote() {
   git remote get-url "$REMOTE" >/dev/null 2>&1 || die "no '$REMOTE' remote here; run: git agent init"
@@ -114,8 +153,9 @@ warn_task() {   # warn_task <task> <remote ref>
   local notes; notes=$(task_notes "$1" "$2" "$(dirty_tasks "$1")")
   [[ -n $notes ]] || return 0
   echo "git agent: warning: agent/$1: $notes" >&2
-  echo "git agent: the agent may not be done, or didn't commit - check: rcoi task peek $repo $1" >&2
-  echo "git agent: or ask it: rcoi task send $repo $1 'commit your work to the current branch'" >&2
+  echo "git agent: the agent may not be done, or didn't commit - check: rcoi task peek $hrepo $1" >&2
+  echo "git agent: its uncommitted work: git agent wip $1; commit it: rcoi task commit $hrepo $1" >&2
+  echo "git agent: (or ask it: rcoi task send $hrepo $1 'commit your work to the current branch')" >&2
 }
 
 cmd=${1:-help}
@@ -281,13 +321,152 @@ case $cmd in
     git push "$REMOTE" "refs/heads/$lb:refs/heads/agent/$task" \
       || die "push refused (above). 'Working directory has ... changes': the agent has uncommitted work in its worktree - let it commit (or stop it), then push again"
     echo "pushed $lb to agent/$task; a running agent doesn't know yet - tell it, e.g.:"
-    echo "  rcoi task send $repo $task 'I pushed new commits to your branch (git log); continue from them'"
+    echo "  rcoi task send $hrepo $task 'I pushed new commits to your branch (git log); continue from them'"
+    ;;
+  update)
+    # Bring newer $BASE into a task: agent's commits -> review/<task>, merge
+    # $BASE there, push it back for the agent to continue from.
+    [[ $# -le 1 ]] || die "usage: git agent update [task]"
+    task=$(task_arg "${1:-}")
+    b=$(branch "$task"); lb="review/$task"
+    git rev-parse -q --verify "refs/heads/$BASE" >/dev/null || die "no local branch $BASE"
+    if git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      git switch -q "$lb"; "$0" pull "$task"
+    else
+      "$0" pull "$task"; git switch -q "$lb"
+    fi
+    if git merge-base --is-ancestor "refs/heads/$BASE" HEAD; then
+      echo "$lb already has everything from $BASE"
+    else
+      git merge -m "Merge $BASE into $lb" "$BASE" \
+        || die "resolve the conflicts on $lb, git commit, then: git agent push $task"
+    fi
+    "$0" push "$task"
+    ;;
+  wip)
+    # The agent's uncommitted changes, straight from its worktree on the host.
+    [[ $# -le 1 ]] || die "usage: git agent wip [task]"
+    task=$(task_arg "${1:-}"); valid_task "$task"; need_remote
+    if [[ -t 1 ]]; then
+      coi_task wip "$hrepo" "$task" --color | LESS=${LESS-FRX} sh -c "$(git var GIT_PAGER)"
+    else
+      coi_task wip "$hrepo" "$task"
+    fi
+    ;;
+  new)
+    # rcoi task new for this repo, after making sure the task starts from your
+    # $BASE: pushed first when it's ahead of the host's (a fast-forward only).
+    [[ $# -ge 1 && $1 != -* ]] || die "usage: git agent new <task> [--no-sync] [--profile P] [mode]"
+    task=$1; shift; valid_task "$task"; need_remote
+    dosync=1
+    if [[ ${1:-} == --no-sync ]]; then dosync=0; shift; fi
+    if git rev-parse -q --verify "refs/heads/$BASE" >/dev/null; then
+      host_base=$(git ls-remote -q "$REMOTE" "refs/heads/$BASE" | cut -f1)
+      if [[ -z $host_base || $host_base == "$(git rev-parse "refs/heads/$BASE")" ]]; then
+        :
+      elif git merge-base --is-ancestor "$host_base" "refs/heads/$BASE" 2>/dev/null; then
+        if ((dosync)); then
+          echo "git agent: your $BASE is ahead of the agent host's - pushing it first (--no-sync: don't)" >&2
+          git push -q "$REMOTE" "$BASE"
+        else
+          echo "git agent: note: the task starts from the host's $BASE, which is behind yours" >&2
+        fi
+      else
+        echo "git agent: warning: $BASE on the agent host differs from yours (not a fast-forward) - the task starts from the host's" >&2
+      fi
+    fi
+    coi_task -t new "$hrepo" "$task" "$@"
     ;;
   merge)
-    b=$(branch "${1:-}")
+    # Merge review/<task> when it has your commits on top of the agent's
+    # (merging only agent/<task> would leave them out), else agent/<task>.
+    [[ $# -eq 1 ]] || die "usage: git agent merge <task>"
+    b=$(branch "$1"); lb="review/$1"; src=$b
+    warn_task "$1" "$b"
+    if git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      if git merge-base --is-ancestor "refs/heads/$lb" "$b"; then
+        :    # nothing of your own there
+      elif git merge-base --is-ancestor "$b" "refs/heads/$lb"; then
+        src=$lb
+        echo "merging $lb: it has your commits on top of agent/$1"
+      else
+        die "$lb and agent/$1 have both moved on: git agent pull $1 first, then merge again"
+      fi
+      if on_branch "$lb" && [[ -n $(git status --porcelain --untracked-files=no) ]]; then
+        die "uncommitted changes on $lb - commit them (they'd be left out) or stash them first"
+      fi
+    fi
     git switch -q "$BASE"
-    git merge --no-ff -m "Merge agent/$1" "$b"
-    echo "next: git push origin $BASE && git agent sync && rcoi task done $repo $1"
+    git merge --no-ff -m "Merge agent/$1" "$src"
+    echo "next: git push origin $BASE && git agent done $1"
+    ;;
+  done)
+    # After merge: sync $BASE, remove the task on the host (coi-task done),
+    # delete review/<task> here. Merged work only - see drop.
+    [[ $# -le 1 ]] || die "usage: git agent done [task]"
+    task=$(task_arg "${1:-}"); valid_task "$task"; need_remote
+    lb="review/$task" rb="refs/remotes/$REMOTE/agent/$task"
+    git fetch -q --prune "$REMOTE"
+    git rev-parse -q --verify "refs/heads/$BASE" >/dev/null || die "no local branch $BASE"
+    git rev-parse -q --verify "$rb" >/dev/null || git rev-parse -q --verify "refs/heads/$lb" >/dev/null \
+      || die "no task $task: no agent/$task on the agent host and no $lb here"
+    for r in "$rb" "refs/heads/$lb"; do
+      if git rev-parse -q --verify "$r" >/dev/null && ! git merge-base --is-ancestor "$r" "refs/heads/$BASE"; then
+        die "${r#refs/*/} is not merged into $BASE - nothing removed (git agent merge $task, or discard it: git agent drop $task)"
+      fi
+    done
+    # The host only removes a branch its own $BASE contains.
+    git push -q "$REMOTE" "$BASE" \
+      || die "pushing $BASE to the agent host was refused (its $BASE moved?) - nothing removed"
+    coi_task done "$hrepo" "$task" || die "removing the task on the agent host failed (above) - local branches kept"
+    if git rev-parse -q --verify "refs/heads/$lb" >/dev/null; then
+      if on_branch "$lb"; then git switch -q "$BASE"; fi
+      git branch -q -D "$lb"    # merged into $BASE, checked above
+      echo "deleted $lb"
+    fi
+    git fetch -q --prune "$REMOTE"
+    echo "done: $task (if you haven't yet: git push origin $BASE)"
+    ;;
+  drop)
+    # Discard a task: the agent's branch, its worktree and session on the host,
+    # and review/<task> here. Asks first (unless -y).
+    yes=0 args=()
+    for a in "$@"; do if [[ $a == -y ]]; then yes=1; else args+=("$a"); fi; done
+    [[ ${#args[@]} -le 1 ]] || die "usage: git agent drop [task] [-y]"
+    task=$(task_arg "${args[0]:-}"); valid_task "$task"; need_remote
+    lb="review/$task" rb="refs/remotes/$REMOTE/agent/$task"
+    git fetch -q --prune "$REMOTE"
+    has_rb=0 has_lb=0
+    git rev-parse -q --verify "$rb" >/dev/null && has_rb=1
+    git rev-parse -q --verify "refs/heads/$lb" >/dev/null && has_lb=1
+    ((has_rb || has_lb)) || die "nothing to drop: no agent/$task on the agent host and no $lb here"
+    if ((!yes)); then
+      [[ -t 0 ]] || die "not a terminal: add -y to confirm"
+      what=()
+      if ((has_rb)); then
+        n=$(git rev-list --count "$rb" --not "refs/heads/$BASE" 2>/dev/null || git rev-list --count "$rb")
+        d=""; [[ -n $(dirty_tasks "$task") ]] && d=", uncommitted changes"
+        what+=("agent/$task and its session on the host ($n commit(s) not in $BASE$d)")
+      fi
+      if ((has_lb)); then
+        excl=("refs/heads/$BASE"); ((has_rb)) && excl+=("$rb")
+        n=$(git rev-list --count "refs/heads/$lb" --not "${excl[@]}")
+        what+=("$lb here ($n commit(s) of your own)")
+      fi
+      printf 'Discard:\n'; printf '  %s\n' "${what[@]}"
+      read -r -p "[y/N] " ans
+      [[ $ans == [yY]* ]] || die "nothing removed"
+    fi
+    if ((has_rb)); then
+      coi_task drop "$hrepo" "$task" -y || die "dropping on the agent host failed (above) - local branches kept"
+    fi
+    if ((has_lb)); then
+      if on_branch "$lb"; then git switch -q "$BASE"; fi
+      git branch -q -D "$lb"
+      echo "deleted $lb"
+    fi
+    git fetch -q --prune "$REMOTE"
+    echo "dropped: $task"
     ;;
   help|-h|--help)
     usage
