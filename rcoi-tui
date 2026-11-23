@@ -22,7 +22,8 @@ are off, and new/done/drop use rcoi task.
   --no-mux       don't share one SSH connection between commands
 
 Keys (? inside the UI shows them too):
-  j/k, arrows    select                    Tab        preview: screen / changes
+  j/k, arrows    select                    v, Space   the agent's screen, whole window
+  Tab            its changes (commits, diffstat), whole window
   R              pick a repo               A          one repo / all repos
   Enter, a       attach (Ctrl+B, d)        n          new task (--bg, optional prompt)
   s              send text to the agent    u          start a session (restarts a dead one)
@@ -170,6 +171,28 @@ def compare_base(path, local):
     return "diverged", "%s differs from the host's" % BASE
 
 
+# The agents' own interface on their screen (boxes, prompts, footers, key hints),
+# skipped when picking out what an agent last said.
+CHROME_RE = re.compile(
+    r"^[\s─━═╭╮╰╯│┃▐▛▜▝▘█▌❯>›·•]*$"
+    r"|bypass permissions|for shortcuts|shift\+tab|context left|⏎ send|Ask Codex"
+    r"|Enter to (select|confirm)|Esc to cancel|to navigate|Type something|Chat about this"
+    r"|^\d[\d,.]*k? tokens$|disable recaps"
+    r"|^\S \w+ed for \d+[hms]",          # Claude's turn footer: "✻ Cooked for 3s · done 8:11 PM"
+    re.I)
+
+
+def excerpt(lines, asking=False, n=2):
+    """What the agent last said, from its screen: the question when it's asking,
+    else the last n lines of real output."""
+    real = [l for l in (l.strip() for l in lines) if l and not CHROME_RE.search(l)]
+    if asking:
+        q = [l for l in real[-25:] if l.endswith("?")]
+        if q:
+            return [q[-1]]
+    return real[-n:]
+
+
 # What `coi tmux capture` says when the container runs but its tmux session doesn't.
 NO_TMUX_RE = re.compile(r"can't find session|no tmux session|no server running|error connecting to", re.I)
 CTRL_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
@@ -204,6 +227,7 @@ class Task:
         self.behind = None
         self.agent = ""         # what the agent is doing (coi-task list): working, waiting, asking, ...
         self.uncommitted = None # files changed in the host's worktree, if known
+        self.work = ""          # coi-task list's "+4 commits, 3 uncommitted"
         self.review = False     # review/<name> exists in the clone
         self.clone = ""         # local clone of the repo ("" if none found)
         self.gone = False       # container up, agent's tmux session gone
@@ -260,6 +284,7 @@ def parse_task_list(text):
             if len(bits) >= 2:
                 t.sessions.append((bits[0], bits[1]))
         t.agent = fields.get("agent", "").strip()
+        t.work = fields.get("work", "").strip()
         m = re.search(r"(\d+) uncommitted", fields.get("work", ""))
         t.uncommitted = int(m.group(1)) if m else (0 if "clean" in fields.get("work", "") else None)
         tasks[t.key] = t
@@ -292,8 +317,8 @@ class Model:
         self.wake_list = threading.Event()
         self.wake_peek = threading.Event()
         self.selected = None            # key of the selected task (set by the UI)
-        self.preview_lines = 20
-        self.preview = "screen"         # or "changes"
+        self.preview_lines = 40         # screen lines to fetch (more in the full view)
+        self.preview = "screen"         # full view: "screen" or "changes"
 
     def visible(self):
         return [t for t in self.tasks if self.view is None or t.repo == self.view]
@@ -379,9 +404,9 @@ class Model:
     def peek_loop(self, interval):
         while True:
             with self.lock:
-                key, n, mode = self.selected, self.preview_lines, self.preview
+                key, n = self.selected, self.preview_lines
                 t = next((x for x in self.tasks if x.key == key), None)
-            if t is not None and mode == "screen" and t.session:
+            if t is not None and t.session:
                 ct = t.session[0]
                 rc, out = run(RCOI + ["task", "peek", t.repo, t.name, str(max(n, 5))], timeout=30)
                 lines = [clean(l) for l in out.splitlines()]
@@ -390,6 +415,8 @@ class Model:
                     lines = ["(the container %s is running, but the agent's tmux session is gone:" % ct,
                              " it exited, or something in it killed the tmux server)", "",
                              "u: restart it (stop + start; the worktree and commits stay)"]
+                elif rc != 0 and not lines:
+                    lines = ["(peek failed, exit %d)" % rc]
                 elif rc != 0:
                     lines = ["(peek failed)"] + lines[-3:]
                 with self.lock:
@@ -537,7 +564,10 @@ class UI:
             cols = [("TASK", 18), ("AGENT", 9), ("WIP", 4), ("PROFILE", 10), ("+/-", 7), ("REVIEW", 6), ("UPDATED", 16)]
             if show_repo:
                 cols.insert(0, ("REPO", 14))
-            table_h = max(3, min(len(tasks) + 1, (h - 6) // 2))
+            # rows: 0-1 header, 2 column titles, then tasks down to the details
+            # panel (a rule + 3 lines) above the status line and the keys
+            panel_y = h - 6
+            table_h = max(2, panel_y - 2)
             y = 2
             x = 1
             for title, cw in cols:
@@ -575,38 +605,10 @@ class UI:
                     x += cw + 1
                 self.put(ry, x, t.subject, base_attr)
 
-            # preview
-            py = y + table_h
-            mode = m.preview
-            if cur and mode == "screen" and not cur.session:
-                mode = "changes"
-            if cur is None:
-                title = " preview "
-            elif mode == "screen":
-                title = " screen: %s (%s, %s) " % (cur.name, cur.session[0], cur.state)
-            else:
-                title = " changes: agent/%s vs %s " % (cur.name, BASE)
-            hint = " Tab: %s " % ("changes" if mode == "screen" else "screen")
-            self.put(py, 0, "─" * w, self.c("dim"))
-            self.put(py, 2, title, curses.A_BOLD)
-            if cur and cur.session:
-                self.put(py, max(len(title) + 3, w - len(hint) - 2), hint, self.c("dim"))
-            body_h = h - py - 3
-            m.preview_lines = body_h
-            lines = []
+            # details of the selected task
+            self.put(panel_y, 0, "─" * w, self.c("dim"))
             if cur is not None:
-                if mode == "screen":
-                    got = m.screens.get(cur.key)
-                    lines = got[1] if got else ["(loading the agent's screen...)"]
-                else:
-                    lines = m.changes_for(cur)
-                    if not cur.session:
-                        lines = lines + ["", "no running session - u: start one, a: attach starts it too"
-                                         if cur.worktree else "no worktree on the host (task done or dropped)"]
-            if mode == "screen":
-                lines = lines[-body_h:] if body_h > 0 else []
-            for i, l in enumerate(lines[:max(body_h, 0)]):
-                self.put(py + 1 + i, 1, l)
+                self.draw_details(panel_y + 1, w, cur)
 
             # status line (or a rule), then the keys - always shown unless prompting
             st = self.status_text()
@@ -638,9 +640,9 @@ class UI:
             if t.gone or t.state == "no agent":
                 items += [("u", "restart")]
             elif t.state == "asking":
-                items += [("⏎", "answer"), ("s", "send"), ("x", "stop")]
+                items += [("⏎", "answer"), ("v", "view"), ("s", "send"), ("x", "stop")]
             elif t.session:
-                items += [("⏎", "attach"), ("s", "send"), ("x", "stop")]
+                items += [("v", "view"), ("⏎", "attach"), ("s", "send"), ("x", "stop")]
             elif t.worktree:
                 items += [("u", "start"), ("⏎", "shell")]
             if t.clone and t.ref:
@@ -654,10 +656,10 @@ class UI:
                   ("o", "output")]
         return items
 
-    def draw_keys(self, y, w, items):
+    def draw_keys(self, y, w, items, tail=(("?", "help"), ("q", "quit"))):
         """The menu: highlighted keys and their labels; what doesn't fit is
-        dropped from the end, but "? help  q quit" always stays at the right."""
-        tail = [("?", "help"), ("q", "quit")]
+        dropped from the end, but the tail ("? help  q quit") stays at the right."""
+        tail = list(tail)
         width = lambda its: sum(len(k) + len(l) + 4 for k, l in its)
         room = w - 1 - width(tail)
         shown_items = []
@@ -675,6 +677,93 @@ class UI:
             self.put(y, x, " %s " % k, self.c("key") or curses.A_REVERSE)
             self.put(y, x + len(k) + 2, label)
             x += len(k) + len(label) + 4
+
+    def draw_details(self, y, w, t):
+        """Three lines about task t: what it is and does, then what the agent last said."""
+        m = self.m
+        bits = [t.name if m.view else "%s/%s" % (t.repo, t.name)]
+        self.put(y, 1, bits[0], curses.A_BOLD)
+        x = 1 + len(bits[0])
+        for text, attr in [(t.state, self.state_attr(t.state)),
+                           (t.session[0] if t.session else "", self.c("dim")),
+                           (t.work, 0)]:
+            if text:
+                self.put(y, x, "  ·  ", self.c("dim"))
+                self.put(y, x + 5, text, attr)
+                x += 5 + len(text)
+        if t.gone or t.state == "no agent":
+            lines = ["the agent's tmux session is gone (it exited, or killed the tmux server)",
+                     "u: restart it (stop + start; the worktree and commits stay)"]
+        elif t.session:
+            got = m.screens.get(t.key)
+            lines = excerpt(got[1], t.state == "asking") if got else ["(loading the agent's screen...)"]
+            lines = lines or ["(nothing on the agent's screen yet)"]
+            if t.session[1] == "frozen":
+                lines = ["paused by Coi's monitor (rcoi unfreeze %s)" % t.session[0]]
+        elif t.worktree:
+            lines = ["no session: u starts one, Enter an interactive one",
+                     "last commit: %s" % t.subject if t.subject else ""]
+        else:
+            lines = ["no worktree on the host (task done or dropped)"]
+        for i, l in enumerate(lines[:2]):
+            if l:
+                self.put(y + 1 + i, 1, "› " + l, curses.A_BOLD if t.state == "asking" else 0)
+
+    def screen_view(self, t, mode=None):
+        """The agent's screen in the whole window, live (Tab: its changes instead)."""
+        m = self.m
+        with m.lock:
+            m.preview = mode or ("screen" if t.session else "changes")
+        top = 0
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                body = h - 2
+                with m.lock:
+                    m.selected, m.preview_lines = t.key, max(body, 5)
+                    mode = m.preview
+                    t = next((x for x in m.tasks if x.key == t.key), t)
+                    if mode == "screen":
+                        got = m.screens.get(t.key)
+                        lines = got[1] if got else ["(loading the agent's screen...)"]
+                        lines = lines[-body:]
+                    else:
+                        lines = m.changes_for(t)
+                self.scr.erase()
+                title = " %s · %s · %s " % (t.name, t.state,
+                                            "live screen (every %gs)" % self.interval if mode == "screen"
+                                            else "changes: agent/%s vs %s" % (t.name, BASE))
+                self.put(0, 0, title.ljust(w), curses.A_REVERSE | curses.A_BOLD)
+                if mode == "changes":
+                    top = max(0, min(top, len(lines) - body))
+                    lines = lines[top:]
+                for i, l in enumerate(lines[:body]):
+                    self.put(1 + i, 1, l)
+                self.draw_keys(h - 1, w, [("Tab", "changes" if mode == "screen" else "screen"),
+                                          ("⏎", "attach"), ("s", "send")], tail=[("Esc", "back")])
+                self.scr.refresh()
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                if ch in ("\x1b", "q", "v", " "):
+                    return
+                if ch == "\t":
+                    with m.lock:
+                        m.preview = "changes" if m.preview == "screen" else "screen"
+                    top = 0
+                    m.wake_peek.set()
+                elif ch in ("\n", "\r", curses.KEY_ENTER, "a"):
+                    self.act_attach(t)
+                elif ch == "s":
+                    self.act_send(t)
+                elif mode == "changes":
+                    top += {"j": 1, curses.KEY_DOWN: 1, "k": -1, curses.KEY_UP: -1,
+                            curses.KEY_NPAGE: body, curses.KEY_PPAGE: -body}.get(ch, 0)
+        finally:
+            with m.lock:
+                m.preview_lines = 40
+            m.wake_peek.set()
 
     def status_text(self):
         """The status to show: while an action runs, with its time; a finished
@@ -1038,10 +1127,12 @@ class UI:
                 self.sel = 0
             elif ch in ("G", curses.KEY_END):
                 self.sel = max(n - 1, 0)
-            elif ch == "\t":
-                with m.lock:
-                    m.preview = "changes" if m.preview == "screen" else "screen"
-                m.wake_peek.set()
+            elif ch in ("v", " ", "\t"):
+                cur = self.current()
+                if cur is None:
+                    self.notify("no task selected")
+                else:
+                    self.screen_view(cur, "changes" if ch == "\t" else None)
             elif ch == "A":
                 cur = self.current()
                 self.set_view(None if m.view else (cur.repo if cur else m.here))

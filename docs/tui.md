@@ -8,16 +8,27 @@ rcoi-tui --all               # every repo's tasks (also the default outside a re
 ```
 
 ```
- rcoi-tui   host: you@agent-host   repo: myrepo
+ rcoi-tui   repo: myrepo   host: you@agent-host
  main in sync
  TASK               AGENT     WIP  PROFILE    +/-     REVIEW UPDATED          LAST COMMIT
  check              waiting        -          +3      yes    5 minutes ago    add star catalogue check
  parser             working   4    codex      +1             1 minute ago     split the lexer
  tui                no agent       -          +7             2 hours ago      curses front end
  new-ui             stopped        codex      +0             3 days ago       start
-── screen: check (coi-f90e18aa-1, waiting) ───────────────────────── Tab: changes ──
- (the agent's screen, refreshed every 2 seconds)
+
+──────────────────────────────────────────────────────────────────────────────────────
+ check  ·  waiting  ·  coi-f90e18aa-1  ·  +3 commits, clean
+ › ● Done: the catalogue check is in, tests pass, committed (a1b2c3d).
+──────────────────────────────────────────────────────────────────────────────────────
+ v view   ⏎ attach   s send   x stop   d diff   t try   m merge   w wip  …   ? help   q quit
 ```
+
+The table takes the window; below it, the selected task's details: its
+state, container and work, and what the agent last said (the question
+itself when it's asking), picked from its screen every 2 seconds. `v` (or
+Space) shows the agent's whole screen, live, in the full window; Tab there
+switches to its changes (commits and diffstat), Enter attaches, `s` sends,
+Esc goes back. Tab from the list opens the changes directly.
 
 It is a front end only: every key runs `rcoi` or `git agent`, and `o` shows
 the commands it ran and their output.
@@ -40,7 +51,7 @@ its own clone (`new` pushes main first, `done`/`drop` also delete
 | `t` | try (`review/<task>`) | `p` / `P` | pull / push `review/<task>` |
 | `U` | update `review/<task>` with main | `m` | merge into main |
 | `D` | done (merged only) | `X` | drop (asks first) |
-| `y` | sync main to the host | `Tab` | preview: screen / changes |
+| `y` | sync main to the host | `v`, Space | the agent's screen, whole window (Tab: changes) |
 | `r` | refresh | `?` | help |
 
 AGENT is what the agent is doing, from `rcoi task list` (see
@@ -53,6 +64,6 @@ terminal app). `u` restarts it (stop + start; worktree and commits stay).
 With an older `coi-task` on the host, AGENT only says `running`: update it
 with `./install.sh`.
 
-Options: `--all` (start with every repo), `--interval SECONDS` (screen refresh, default 2),
+Options: `--all` (start with every repo), `--interval SECONDS` (how often the selected agent's screen is read, default 2),
 `--no-mux` (by default it shares one SSH connection between its commands).
 Tests: `python3 -m unittest discover tests` (fake `rcoi`/`git-agent`, no host needed).
