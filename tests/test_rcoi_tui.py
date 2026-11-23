@@ -70,6 +70,55 @@ class ParseTest(unittest.TestCase):
         self.assertTrue(tui.NO_TMUX_RE.search(out))
         self.assertFalse(tui.NO_TMUX_RE.search("╭ Claude Code ╮\n> \n  bypass permissions on\n"))
 
+    def test_excerpt(self):
+        # A Claude question dialog (the test5 session): the question itself.
+        asking = """ ▐▛███▛█   Claude Code v2.1.319
+ ❯ ask me a question
+ ────────────────────────────────────────
+  ☐ Next step
+
+ What would you like to work on next in stanal-test5 (branch agent/test5)?
+
+ ❯ 1. Review current code
+      Look over the 'first working code' commit and point out bugs or cleanups
+   2. Continue the plan
+   5. Type something.
+ ────────────────────────────────────────
+   6. Chat about this
+
+ Enter to select · ↑/↓ to navigate · Esc to cancel
+""".splitlines()
+        self.assertEqual(tui.excerpt(asking, asking=True),
+                         ["What would you like to work on next in stanal-test5 (branch agent/test5)?"])
+        # Claude done: its last message, not the input box or footer.
+        waiting = """● Fixed the parser.
+● Done: the tests pass and the fix is committed (a1b2c3d).
+
+✻ Cooked for 3s · done 8:11 PM
+                                                                21326 tokens
+────────────────────────────────────────
+❯
+────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+""".splitlines()
+        self.assertEqual(tui.excerpt(waiting), ["● Fixed the parser.",
+                                                "● Done: the tests pass and the fix is committed (a1b2c3d)."])
+        # Working: the spinner line says what it's doing.
+        working = """● Reading the test suite
+✻ Pondering… (12s · ↑ 1.2k tokens · esc to interrupt)
+╭──────────────╮
+│ >            │
+╰──────────────╯
+""".splitlines()
+        self.assertEqual(tui.excerpt(working)[-1], "✻ Pondering… (12s · ↑ 1.2k tokens · esc to interrupt)")
+        # Codex waiting.
+        codex = """• I updated the parser and added tests.
+
+▌ Ask Codex to do anything
+  ⏎ send   ⌃J newline   ⌃T transcript   ⌃C quit   97% context left
+""".splitlines()
+        self.assertEqual(tui.excerpt(codex, n=1), ["• I updated the parser and added tests."])
+
     def test_clean(self):
         self.assertEqual(tui.clean("\x1b[31mred\x1b[0m\tx\r\n"), "red    x")
 
@@ -358,6 +407,22 @@ class TuiTest(unittest.TestCase):
         self.start()
         self.ready()
         self.wait_for("too old to show what agents are doing")
+
+    def test_full_screen_view(self):
+        self.start()
+        self.ready()
+        self.key("j")
+        self.wait_for("AGENT SCREEN OF work")   # in the details panel
+        self.key("v")
+        self.wait_for("live screen")
+        self.key("\t")
+        self.wait_for("commits not in main")
+        self.key("\x1b")                        # back to the list
+        self.wait_for("LAST COMMIT")
+        self.key("\t")                          # Tab from the list: straight to the changes
+        self.wait_for("changes: agent/work vs main")
+        self.key("q")
+        self.wait_for("LAST COMMIT")
 
     def test_status_clears_and_keys_stay(self):
         self.start()

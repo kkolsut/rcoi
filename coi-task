@@ -384,7 +384,7 @@ cmd_peek() {
   local lines=${3:-40}
   [[ $lines =~ ^[0-9]+$ ]] || usage 1
   local wt ct; wt=$(wt_dir "$1" "$2"); ct=$(container "$wt")
-  coi tmux capture "$ct" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$lines"
+  capture "$ct" | sed -e :a -e '/^[[:space:]]*$/{$d;N;ba' -e '}' | tail -n "$lines"
 }
 
 cmd_send() {
@@ -397,6 +397,13 @@ cmd_send() {
 # Claude and Codex show while they work, three checks in a row (an agent can
 # pause briefly between steps). Right after a send the agent may not have
 # started yet; that's what the repeated checks are for, too.
+# The agent's screen, from tmux in the container directly: a quarter of the
+# time `coi tmux capture` takes. -T: no pty. Fails (can't find session) when
+# the agent's tmux session is gone.
+capture() {   # capture <container>
+  incus exec -T "$1" --user 1000 -- tmux capture-pane -p -t "=coi-$1:" </dev/null
+}
+
 # What the agent in a container is doing, read from its screen (like `wait`):
 #   working   it shows "esc to interrupt" (Claude and Codex, while busy)
 #   asking    a question or approval on screen (permission, trust, login, a choice)
@@ -407,8 +414,7 @@ cmd_send() {
 # screen counts, so text in the conversation can't fool it.
 agent_state() {   # agent_state <container>
   local screen
-  # tmux directly (not `coi tmux capture`: half the time). -T: no pty.
-  if ! screen=$(incus exec -T "$1" --user 1000 -- tmux capture-pane -p -t "=coi-$1:" </dev/null 2>&1); then
+  if ! screen=$(capture "$1" 2>&1); then
     if grep -qiE "can't find session|no server running|error connecting" <<<"$screen"; then
       echo "no agent"
     else
